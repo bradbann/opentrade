@@ -2,6 +2,7 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 
+#include "cross_engine.h"
 #include "logger.h"
 #include "risk.h"
 
@@ -95,23 +96,26 @@ void ExchangeConnectivityManager::HandleFilled(Order* ord, double qty,
                      kTransNew);
 }
 
-static inline bool CheckAdapter(ExchangeConnectivityAdapter* adapter,
-                                const char* name) {
+static inline auto CheckAdapter(Order* ord) {
+  auto adapter = ord->broker_account->adapter;
+  auto name = ord->broker_account->adapter_name;
+  if (!ord->destination.empty()) {
+    name = ord->destination.c_str();
+    adapter = ExchangeConnectivityManager::Instance().GetAdapter(name);
+  }
+  char buf[256];
   if (!adapter) {
-    char buf[256];
     snprintf(buf, sizeof(buf),
              "Exchange connectivity adapter '%s' is not started", name);
     kRiskError = buf;
-    return false;
-  }
-  if (!adapter->connected()) {
-    char buf[256];
+  } else if (!adapter->connected()) {
     snprintf(buf, sizeof(buf),
              "Exchange connectivity adapter '%s' is disconnected", name);
     kRiskError = buf;
-    return false;
+    adapter = nullptr;
   }
-  return true;
+  if (!kRiskError.empty()) HandleConfirmation(ord, kRiskRejected, kRiskError);
+  return adapter;
 }
 
 bool ExchangeConnectivityManager::Place(Order* ord) {
@@ -152,15 +156,12 @@ bool ExchangeConnectivityManager::Place(Order* ord) {
     return true;
   } else if (ord->type == kCX) {
     ord->id = GlobalOrderBook::Instance().NewOrderId();
+    CrossEngine::Instance().Place(static_cast<CrossOrder*>(ord));
     HandleConfirmation(ord, kUnconfirmedNew);
     return true;
   }
-  auto adapter = ord->broker_account->adapter;
-  auto name = ord->broker_account->adapter_name;
-  if (!CheckAdapter(adapter, name)) {
-    HandleConfirmation(ord, kRiskRejected, kRiskError);
-    return false;
-  }
+  auto adapter = CheckAdapter(ord);
+  if (!adapter) return false;
   if (ord->type == kMarket || ord->type == kStop) {
     if (ord->price <= 0) {
       ord->price = ord->sec->CurrentPrice();
@@ -197,17 +198,13 @@ static inline bool Cancel(Order* cancel_order) {
   if (!RiskManager::Instance().CheckMsgRate(*cancel_order)) {
     HandleConfirmation(cancel_order, kRiskRejected, kRiskError);
     static uint32_t seed;
-    kSharedTaskPool.AddTask(
+    kTimerTaskPool.AddTask(
         [cancel_order]() { Cancel(cancel_order); },
         boost::posix_time::milliseconds(1000 + rand_r(&seed) % 1000));
     return false;
   }
-  auto adapter = cancel_order->broker_account->adapter;
-  auto name = cancel_order->broker_account->adapter_name;
-  if (!CheckAdapter(adapter, name)) {
-    HandleConfirmation(cancel_order, kRiskRejected, kRiskError);
-    return false;
-  }
+  auto adapter = CheckAdapter(cancel_order);
+  if (!adapter) return false;
   HandleConfirmation(cancel_order, kUnconfirmedCancel, "", cancel_order->tm);
   cancel_order->id = GlobalOrderBook::Instance().NewOrderId();
   kRiskError = adapter->Cancel(*cancel_order);
@@ -220,7 +217,11 @@ static inline bool Cancel(Order* cancel_order) {
 }
 
 bool ExchangeConnectivityManager::Cancel(const Order& orig_ord) {
-  if (orig_ord.type == kOTC || orig_ord.type == kCX) return false;
+  if (orig_ord.type == kCX) {
+    CrossEngine::Instance().Erase(static_cast<const CrossOrder&>(orig_ord));
+    return true;
+  }
+  if (orig_ord.type == kOTC) return false;
   assert(orig_ord.sub_account);
   assert(orig_ord.sec);
   assert(orig_ord.user);

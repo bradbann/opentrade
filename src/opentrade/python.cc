@@ -4,6 +4,7 @@
 #include <boost/filesystem.hpp>
 
 #include "backtest.h"
+#include "bar_handler.h"
 #include "logger.h"
 #include "server.h"
 
@@ -167,7 +168,7 @@ BOOST_PYTHON_MODULE(opentrade) {
   bp::class_<DataSrc>("DataSrc", bp::init<const char *>())
       .def("__str__", &DataSrc::str);
 
-  bp::class_<SubAccount>("SubAccount", bp::no_init)
+  bp::class_<SubAccount, boost::noncopyable>("SubAccount", bp::no_init)
       .def("__str__",
            +[](const SubAccount &acc) { return std::string(acc.name); })
       .add_property(
@@ -185,7 +186,7 @@ BOOST_PYTHON_MODULE(opentrade) {
       .def_readonly("id", &SubAccount::id)
       .def_readonly("name", &SubAccount::name);
 
-  bp::class_<Exchange>("Exchange", bp::no_init)
+  bp::class_<Exchange, boost::noncopyable>("Exchange", bp::no_init)
       .def("__str__", +[](const Exchange &ex) { return std::string(ex.name); })
       .def_readonly("name", &Exchange::name)
       .def_readonly("mic", &Exchange::mic)
@@ -237,7 +238,7 @@ BOOST_PYTHON_MODULE(opentrade) {
       .def_readonly("total_outstanding_sell_qty",
                     &Position::total_outstanding_sell_qty);
 
-  auto cls = bp::class_<Security>("Security", bp::no_init);
+  auto cls = bp::class_<Security, boost::noncopyable>("Security", bp::no_init);
   cls.def_readonly("id", &Security::id)
       .def("__str__",
            +[](const Security &s) {
@@ -363,6 +364,23 @@ BOOST_PYTHON_MODULE(opentrade) {
       .def_readwrite("tif", &Contract::tif)
       .def_readwrite("type", &Contract::type);
 
+  bp::class_<MarketData::Trade>("Bar", bp::no_init)
+      .def_readonly("tm", &MarketData::Trade::tm)
+      .def_readonly("open", &MarketData::Trade::open)
+      .def_readonly("high", &MarketData::Trade::high)
+      .def_readonly("low", &MarketData::Trade::low)
+      .def_readonly("close", &MarketData::Trade::close)
+      .def_readonly("qty", &MarketData::Trade::qty)
+      .def_readonly("volume", &MarketData::Trade::volume)
+      .def_readonly("vwap", &MarketData::Trade::vwap)
+      .def("__str__", +[](const MarketData::Trade &t) {
+        std::stringstream ss;
+        ss << "tm=" << t.tm << ", open=" << t.open << ", high=" << t.high
+           << ", low=" << t.low << ", close=" << t.close << ", qty=" << t.qty
+           << ", volume=" << t.volume << ", vwap=" << t.vwap;
+        return ss.str();
+      });
+
   bp::class_<MarketData>("MarketData", bp::no_init)
       .def_readonly("tm", &MarketData::tm)
       .add_property("open", +[](const MarketData &md) { return md.trade.open; })
@@ -458,6 +476,15 @@ BOOST_PYTHON_MODULE(opentrade) {
       .add_property("total_cx_qty", &Instrument::total_cx_qty)
       .add_property("id", &Instrument::id)
       .def("unlisten", &Instrument::UnListen)
+      .def("subscribe", &Instrument::SubscribeByName,
+           (bp::arg("self"), bp::arg("indicator_name"),
+            bp::arg("listen") = false))
+      .def("get",
+           +[](Instrument &inst, Indicator::IdType indicator_id) {
+             auto ind = inst.Get(indicator_id);
+             if (ind) return ind->GetPyObject();
+             return bp::object{};
+           })
       .add_property("active_orders", +[](const Instrument &inst) {
         return OrdersWrapper(&inst.active_orders());
       });
@@ -493,6 +520,13 @@ BOOST_PYTHON_MODULE(opentrade) {
                 return SecurityManager::Instance().GetExchange(name);
               },
               bp::return_value_policy<bp::reference_existing_object>()));
+
+#ifdef BACKTEST
+  bp::def("add_simulator", bp::make_function(+[](const std::string &fn_tmpl,
+                                                 const std::string &name) {
+            Backtest::Instance().AddSimulator(fn_tmpl, name);
+          }));
+#endif
 
   bp::def("get_account",
           bp::make_function(
@@ -530,11 +564,13 @@ BOOST_PYTHON_MODULE(opentrade) {
                            },
                            0));
 
-  bp::def("get_time", +[]() { return NowUtcInMicro() / 1e6; });
+  bp::def("get_time",
+          +[]() { return NowUtcInMicro() / static_cast<double>(kMicroInSec); });
   bp::def("get_datetime", +[]() {
     return bp::import("datetime")
         .attr("datetime")
-        .attr("fromtimestamp")(NowUtcInMicro() / 1e6);
+        .attr("fromtimestamp")(NowUtcInMicro() /
+                               static_cast<double>(kMicroInSec));
   });
 
   bp::def("get_exchanges", +[]() {
@@ -547,12 +583,16 @@ BOOST_PYTHON_MODULE(opentrade) {
 
 #ifdef BACKTEST
   bp::class_<Backtest, boost::noncopyable>("Backtest", bp::no_init)
-      .def("clear", &Backtest::Clear)
+      .def("clear",
+           +[](Backtest &) {
+             // clear is called allways, not clearing cause a lot of problems
+             LOG2_WARN("backtest clear is deprecated");
+           })
       .def("skip", &Backtest::Skip)
       .def("set_timeout",
            +[](Backtest &, bp::object func, double seconds) {
              if (seconds < 0) seconds = 0;
-             kTimers.emplace(kTime + seconds * 1e6, [func]() {
+             kTimers.emplace(kTime + seconds * kMicroInSec, [func]() {
                try {
                  func();
                } catch (const bp::error_already_set &err) {
@@ -697,6 +737,7 @@ PyModule LoadPyModule(const std::string &module_name) {
   out.on_market_trade = GetCallable(m, "on_market_trade");
   out.on_market_quote = GetCallable(m, "on_market_quote");
   out.on_confirmation = GetCallable(m, "on_confirmation");
+  out.on_indicator = GetCallable(m, "on_indicator");
   return out;
 }
 
@@ -945,6 +986,19 @@ void Python::OnConfirmation(const Confirmation &cm) noexcept {
     py_.on_confirmation(obj_, bp::ptr(&cm));
   } catch (const bp::error_already_set &err) {
     PrintPyError("on_confirmation");
+  }
+}
+
+void Python::OnIndicator(Indicator::IdType id,
+                         const Instrument &inst) noexcept {
+  if (!py_.on_indicator) return;
+  auto ind = inst.Get(id);
+  if (!ind) return;
+  LOCK();
+  try {
+    py_.on_indicator(obj_, ind->GetPyObject(), bp::ptr(&inst));
+  } catch (const bp::error_already_set &err) {
+    PrintPyError("on_indicator");
   }
 }
 

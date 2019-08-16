@@ -72,6 +72,7 @@ enum ExecTransType : char {
 };
 
 static inline bool IsBuy(OrderSide side) { return side == kBuy; }
+static inline bool IsShort(OrderSide side) { return side == kShort; }
 
 struct Contract {
   double qty = 0;
@@ -82,14 +83,21 @@ struct Contract {
     const SubAccount* sub_account = nullptr;
     const SubAccount* acc;  // alias of sub_account
   };
+  // Usually you do not need to set destination,
+  // We can find destination automatically from broker_account via predefined
+  // sub_account_broker_account_map table. But for smart route or FX aggregator,
+  // one primary exchange have many venues (ECN or LP), you need to set
+  // destination manually.
+  std::string destination;
   std::map<std::string,
-           std::variant<bool, int64_t, double, std::string, std::any>>*
+           std::variant<bool, int64_t, double, char, std::string, std::any>>*
       optional = nullptr;
   OrderSide side = kBuy;
   OrderType type = kLimit;
   TimeInForce tif = kDay;
 
   bool IsBuy() const { return opentrade::IsBuy(side); }
+  bool IsShort() const { return opentrade::IsShort(side); }
 };
 
 class Instrument;
@@ -108,7 +116,7 @@ struct Order : public Contract {
   double leaves_qty = 0;
   int64_t tm = 0;
   const User* user = nullptr;
-  const BrokerAccount* broker_account = nullptr;
+  const BrokerAccount* broker_account = nullptr;  // primary broker account
   const Instrument* inst = nullptr;
 
   bool IsLive() const {
@@ -153,6 +161,7 @@ class GlobalOrderBook : public Singleton<GlobalOrderBook> {
   void Cancel();
   void Handle(Confirmation::Ptr cm, bool offline = false);
   void LoadStore(uint32_t seq0 = 0, Connection* conn = nullptr);
+  void ReadPreviousDayExecIds();
 
  private:
   void UpdateOrder(Confirmation::Ptr cm);

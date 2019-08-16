@@ -4,20 +4,19 @@
 
 namespace opentrade {
 
-std::string TWAP::OnStart(const ParamMap& params) noexcept {
-  SecurityTuple st{};
-  st = GetParam(params, "Security", st);
-  auto src = st.src;
-  auto sec = st.sec;
-  acc_ = st.acc;
-  side_ = st.side;
-  qty_ = st.qty;
-  assert(sec);  // SecurityTuple already verified before onStart
-  assert(acc_);
-  assert(side_);
-  assert(qty_ > 0);
+Instrument* TWAP::Subscribe() {
+  return Algo::Subscribe(*st_.sec, st_.src, false);
+}
 
-  inst_ = Subscribe(*sec, src, false);
+std::string TWAP::OnStart(const ParamMap& params) noexcept {
+  st_ = GetParam(params, "Security", st_);
+  auto sec = st_.sec;
+  assert(sec);  // SecurityTuple already verified before onStart
+  assert(st_.acc);
+  assert(st_.side);
+  assert(st_.qty > 0);
+
+  inst_ = Subscribe();
   initial_volume_ = inst_->md().trade.volume;
   auto seconds = GetParam(params, "ValidSeconds", 0);
   if (seconds < 60) return "Too short ValidSeconds, must be >= 60";
@@ -31,6 +30,8 @@ std::string TWAP::OnStart(const ParamMap& params) noexcept {
   if (min_size_ > 0 && sec->lot_size > 0) {
     min_size_ = std::round(min_size_ / sec->lot_size) * sec->lot_size;
   }
+  max_floor_ = GetParam(params, "MaxFloor", 0);
+  if (min_size_ > 0 && max_floor_ < min_size_) max_floor_ = 0;
   max_pov_ = GetParam(params, "MaxPov", 0.0);
   if (max_pov_ > 1) max_pov_ = 1;
   auto agg = GetParam(params, "Aggression", kEmptyStr);
@@ -45,7 +46,7 @@ std::string TWAP::OnStart(const ParamMap& params) noexcept {
   else
     return "Invalid aggression, must be in (Low, Medium, High, Highest)";
   if (GetParam(params, "InternalCross", kEmptyStr) == "Yes") {
-    Cross(qty_, price_, side_, acc_, inst_);
+    Cross(st_.qty, price_, st_.side, st_.acc, inst_);
   }
   Timer();
   LOG_DEBUG('[' << name() << ' ' << id() << "] started");
@@ -76,7 +77,7 @@ void TWAP::OnMarketQuote(const Instrument& inst, const MarketData& md,
 }
 
 void TWAP::OnConfirmation(const Confirmation& cm) noexcept {
-  if (inst_->total_qty() >= qty_) Stop();
+  if (inst_->total_qty() >= st_.qty) Stop();
 }
 
 const ParamDefs& TWAP::GetParamDefs() noexcept {
@@ -85,6 +86,7 @@ const ParamDefs& TWAP::GetParamDefs() noexcept {
       {"Price", 0.0, false, 0, 10000000, 7},
       {"ValidSeconds", 300, true, 60},
       {"MinSize", 0, false, 0, 10000000},
+      {"MaxFloor", 0, false, 0, 10000000},
       {"MaxPov", 0.0, false, 0, 1, 2},
       {"Aggression", ParamDef::ValueVector{"Low", "Medium", "High", "Highest"},
        true},
@@ -93,8 +95,14 @@ const ParamDefs& TWAP::GetParamDefs() noexcept {
   return defs;
 }
 
+double TWAP::GetLeaves() noexcept {
+  auto ratio = std::min(1., (GetTime() - begin_time_ + 1) /
+                                (0.8 * (end_time_ - begin_time_) + 1));
+  auto expect = st_.qty * ratio;
+  return expect - inst_->total_exposure();
+}
+
 void TWAP::Timer() {
-  if (!is_active()) return;
   auto now = GetTime();
   if (now > end_time_) {
     Stop();
@@ -103,7 +111,7 @@ void TWAP::Timer() {
   SetTimeout([this]() { Timer(); }, 1);
   if (!inst_->sec().IsInTradePeriod()) return;
 
-  auto& md = inst_->md();
+  auto& md = this->md();
   auto bid = md.quote().bid_price;
   auto ask = md.quote().ask_price;
   auto last_px = md.trade.close;
@@ -112,7 +120,7 @@ void TWAP::Timer() {
     mid_px = (ask + bid) / 2;
     auto tick_size = inst_->sec().GetTickSize(mid_px);
     if (tick_size > 0) {
-      if (IsBuy(side_))
+      if (IsBuy(st_.side))
         mid_px = std::ceil(mid_px / tick_size) * tick_size;
       else
         mid_px = std::floor(mid_px / tick_size) * tick_size;
@@ -121,7 +129,7 @@ void TWAP::Timer() {
 
   if (!inst_->active_orders().empty()) {
     for (auto ord : inst_->active_orders()) {
-      if (IsBuy(side_)) {
+      if (IsBuy(st_.side)) {
         if (ord->price < bid) {
           Cancel(*ord);
         }
@@ -138,28 +146,26 @@ void TWAP::Timer() {
   if (volume > 0 && max_pov_ > 0) {
     if (inst_->total_qty() - inst_->total_cx_qty() > max_pov_ * volume) return;
   }
-
-  auto ratio = std::min(
-      1., (now - begin_time_ + 1) / (0.8 * (end_time_ - begin_time_) + 1));
-  auto expect = qty_ * ratio;
-  auto leaves = expect - inst_->total_exposure();
+  auto leaves = GetLeaves();
   if (leaves <= 0) return;
-  auto total_leaves = qty_ - inst_->total_exposure();
-  auto lot_size = std::max(1, inst_->sec().lot_size);
-  auto max_qty = inst_->sec().exchange->odd_lot_allowed
-                     ? total_leaves
-                     : std::floor(total_leaves / lot_size) * lot_size;
+  auto total_leaves = st_.qty - inst_->total_exposure();
+  auto lot_size = inst_->sec().lot_size;
+  auto odd_ok = inst_->sec().exchange->odd_lot_allowed || (lot_size <= 0);
+  if (lot_size <= 0) lot_size = std::max(1, min_size_);
+  auto max_qty =
+      odd_ok ? total_leaves : std::floor(total_leaves / lot_size) * lot_size;
   if (max_qty <= 0) return;
   auto would_qty = std::ceil(leaves / lot_size) * lot_size;
   if (would_qty < min_size_) would_qty = min_size_;
   if (would_qty > max_qty) would_qty = max_qty;
+  if (max_floor_ > 0 && would_qty > max_floor_) would_qty = max_floor_;
   Contract c;
-  c.side = side_;
+  c.side = st_.side;
   c.qty = would_qty;
-  c.sub_account = acc_;
+  c.sub_account = st_.acc;
   switch (agg_) {
     case kAggLow:
-      if (IsBuy(side_)) {
+      if (IsBuy(st_.side)) {
         if (bid > 0)
           c.price = bid;
         else if (last_px > 0)
@@ -181,7 +187,7 @@ void TWAP::Timer() {
         break;
       }  // else go to kAggHigh
     case kAggHigh:
-      if (IsBuy(side_)) {
+      if (IsBuy(st_.side)) {
         if (ask > 0) {
           c.price = ask;
           break;
@@ -197,14 +203,10 @@ void TWAP::Timer() {
       c.type = kMarket;
       break;
   }
-  if (price_ > 0 && ((IsBuy(side_) && c.price > price_) ||
-                     (!IsBuy(side_) && c.price < price_)))
+  if (price_ > 0 && ((IsBuy(st_.side) && c.price > price_) ||
+                     (!IsBuy(st_.side) && c.price < price_)))
     return;
-  Place(c, inst_);
+  Place(&c);
 }
 
 }  // namespace opentrade
-
-extern "C" {
-opentrade::Adapter* create() { return new opentrade::TWAP{}; }
-}

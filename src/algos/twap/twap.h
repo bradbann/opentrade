@@ -25,16 +25,19 @@ class TWAP : public Algo {
   void OnConfirmation(const Confirmation& cm) noexcept override;
   const ParamDefs& GetParamDefs() noexcept override;
   void Timer();
+  virtual Instrument* Subscribe();
+  virtual const MarketData& md() { return inst_->md(); }
+  virtual void Place(Contract* c) { Algo::Place(*c, inst_); }
+  virtual double GetLeaves() noexcept;
 
- private:
+ protected:
   Instrument* inst_ = nullptr;
-  const SubAccount* acc_ = nullptr;
-  double qty_ = 0;
+  SecurityTuple st_;
   double price_ = 0;
-  OrderSide side_ = kBuy;
   time_t begin_time_ = 0;
   time_t end_time_ = 0;
-  double min_size_ = 0;
+  int min_size_ = 0;
+  int max_floor_ = 0;
   double max_pov_ = 0;
   double initial_volume_ = 0;
   Aggression agg_ = kAggLow;

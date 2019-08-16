@@ -9,10 +9,14 @@
 #include "account.h"
 #include "algo.h"
 #include "backtest.h"
+#include "bar_handler.h"
+#include "commission.h"
+#include "consolidation.h"
 #include "database.h"
 #include "exchange_connectivity.h"
 #include "logger.h"
 #include "market_data.h"
+#include "opentick.h"
 #include "position.h"
 #include "python.h"
 #include "risk.h"
@@ -23,6 +27,7 @@ namespace bpo = boost::program_options;
 namespace fs = boost::filesystem;
 using opentrade::AlgoManager;
 using opentrade::ExchangeConnectivityManager;
+using opentrade::kAdapterPrefixes;
 using opentrade::kAlgoPath;
 using opentrade::kStorePath;
 using opentrade::MarketDataManager;
@@ -32,8 +37,10 @@ int main(int argc, char *argv[]) {
   std::string config_file_path;
   std::string log_config_file_path;
   std::string db_url;
+  std::string opentick_url;
   uint16_t db_pool_size = 1;
   auto db_create_tables = false;
+  auto db_alter_tables = false;
   auto algo_threads = 0;
 #ifdef BACKTEST
   std::string backtest_file;
@@ -67,6 +74,9 @@ int main(int argc, char *argv[]) {
         ("db_create_tables",
          bpo::value<bool>(&db_create_tables)->default_value(false),
          "create database tables")(
+            "db_alter_tables",
+            bpo::value<bool>(&db_alter_tables)->default_value(false),
+            "alter database tables")(
             "db_pool_size",
             bpo::value<uint16_t>(&db_pool_size)->default_value(4),
             "database connection pool size")(
@@ -86,7 +96,9 @@ int main(int argc, char *argv[]) {
                                      ->default_value("log.conf"),
                                  "log4cxx config file path")(
                 "db_url", bpo::value<std::string>(&db_url),
-                "database connection url");
+                "database connection url")(
+                "opentick", bpo::value<std::string>(&opentick_url),
+                "opentick connection url");
 
     bpo::options_description config_file_options;
     config_file_options.add(config);
@@ -125,18 +137,23 @@ int main(int argc, char *argv[]) {
     LOG_ERROR("db_url not configured");
     return 1;
   }
-  opentrade::Database::Initialize(db_url, db_pool_size, db_create_tables);
+  opentrade::Database::Initialize(db_url, db_pool_size, db_create_tables,
+                                  db_alter_tables);
   opentrade::SecurityManager::Initialize();
 
 #ifdef BACKTEST
+  if (backtest_file.empty()) {
+    LOG_FATAL("backtest file is not given");
+    return -1;
+  }
+  if (!fs::exists(backtest_file)) {
+    LOG_FATAL("backtest file '" << backtest_file << "' does not exist");
+  }
   if (end_date < start_date) {
     LOG_FATAL("end_date < start_date");
   }
   if (start_date < 19000000) {
     LOG_FATAL("Invalid start_date " << start_date);
-  }
-  if (tick_file.empty()) {
-    LOG_FATAL("empty tick_file");
   }
 #else
   if (!fs::exists(kStorePath)) {
@@ -152,6 +169,7 @@ int main(int argc, char *argv[]) {
   for (auto &section : prop_tree) {
     if (!section.second.size()) continue;
     auto section_name = section.first;
+    if (section_name.empty()) continue;
     opentrade::Adapter::StrMap params;
     for (auto &item : section.second) {
       auto name = item.first;
@@ -171,20 +189,24 @@ int main(int argc, char *argv[]) {
                 << opentrade::kApiVersion);
       continue;
     }
-    if (section_name.find("md_") == 0) {
+    if (section_name.find(kAdapterPrefixes[opentrade::kMdPrefix]) == 0) {
       auto md = dynamic_cast<opentrade::MarketDataAdapter *>(adapter);
       if (!md) LOG_FATAL("Failed to load MarketDataAdapter " << section_name);
-      MarketDataManager::Instance().Add(md);
-    } else if (section_name.find("ec_") == 0) {
+      MarketDataManager::Instance().AddAdapter(md);
+    } else if (section_name.find(kAdapterPrefixes[opentrade::kEcPrefix]) == 0) {
       auto ec = dynamic_cast<opentrade::ExchangeConnectivityAdapter *>(adapter);
       if (!ec)
         LOG_FATAL("Failed to load ExchangeConnectivityAdapter "
                   << section_name);
-      ExchangeConnectivityManager::Instance().Add(ec);
+      ExchangeConnectivityManager::Instance().AddAdapter(ec);
+    } else if (section_name.find(kAdapterPrefixes[opentrade::kCmPrefix]) == 0) {
+      auto cm = dynamic_cast<opentrade::CommissionAdapter *>(adapter);
+      if (!cm) LOG_FATAL("Failed to load CommissionAdapter " << section_name);
+      opentrade::CommissionManager::Instance().AddAdapter(cm);
     } else {
       auto algo = dynamic_cast<opentrade::Algo *>(adapter);
       if (!algo) LOG_FATAL("Failed to load Algo " << section_name);
-      AlgoManager::Instance().Add(algo);
+      AlgoManager::Instance().AddAdapter(algo);
     }
   }
 
@@ -206,7 +228,7 @@ int main(int argc, char *argv[]) {
          boost::make_iterator_range(fs::directory_iterator(kAlgoPath), {})) {
       auto path = entry.path();
       auto fn = path.filename().string();
-      if (fn[0] == '_' && fn[0] == '.') continue;
+      if (fn[0] == '.') continue;
       opentrade::Algo *algo = nullptr;
       auto algoname = fn.substr(0, fn.length() - 3);
       if (path.extension() == ".py") {
@@ -225,12 +247,18 @@ int main(int argc, char *argv[]) {
       }
       if (algo) {
         algo->set_name(algoname);
-        AlgoManager::Instance().Add(algo);
+        AlgoManager::Instance().AddAdapter(algo);
       } else {
         LOG_ERROR("Failed to load algo file " << path);
       }
     }
   }
+
+  if (opentick_url.size())
+    opentrade::OpenTick::Instance().Initialize(opentick_url);
+
+  AlgoManager::Instance().AddAdapter(new opentrade::BarHandler<>);
+  AlgoManager::Instance().AddAdapter(new opentrade::ConsolidationHandler);
 
   for (auto &p : MarketDataManager::Instance().adapters()) {
     p.second->Start();
@@ -238,18 +266,21 @@ int main(int argc, char *argv[]) {
   for (auto &p : ExchangeConnectivityManager::Instance().adapters()) {
     p.second->Start();
   }
+  for (auto &p : AlgoManager::Instance().adapters()) {
+    p.second->Start();
+  }
 
   AlgoManager::Instance().Run(algo_threads);
 
 #ifdef BACKTEST
   auto &bt = opentrade::Backtest::Instance();
-  bt.Start(backtest_file, latency);
+  bt.Start(backtest_file, latency, tick_file);
   boost::gregorian::date dt(start_date / 10000, start_date % 10000 / 100,
                             start_date % 100);
   boost::gregorian::date end(end_date / 10000, end_date % 10000 / 100,
                              end_date % 100);
   while (dt <= end) {
-    bt.PlayTickFile(tick_file, dt);
+    bt.Play(dt);
     dt += boost::gregorian::date_duration(1);
   }
   bt.End();
@@ -258,7 +289,12 @@ int main(int argc, char *argv[]) {
     LOG_FATAL("At least one market data adapter required");
     return -1;
   }
-  PositionManager::Instance().UpdatePnl();
+  // wait for some time to get last price updated
+  // to-do: update last price from opentick
+  auto wait = getenv("UPDATE_PNL_WAIT");
+  opentrade::kTimerTaskPool.AddTask(
+      []() { PositionManager::Instance().UpdatePnl(); },
+      boost::posix_time::seconds(wait ? atoi(wait) : 15));
   opentrade::Server::Start(port, io_threads);
 #endif
 

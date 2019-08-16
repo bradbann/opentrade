@@ -21,7 +21,11 @@ struct Position : public PositionValue {
   double avg_px = 0;
   double unrealized_pnl = 0;
   double realized_pnl = 0;
+  double realized_pnl0 = 0;  // no rate * multiplier
+  double commission = 0;
+  double commission0 = 0;  // no rate * multiplier
 
+  // intraday
   double total_bought_qty = 0;
   double total_sold_qty = 0;
   double total_outstanding_buy_qty = 0;
@@ -29,7 +33,8 @@ struct Position : public PositionValue {
 
   void HandleNew(bool is_buy, double qty, double price, double multiplier);
   void HandleTrade(bool is_buy, double qty, double price, double price0,
-                   double multiplier, bool is_bust, bool is_otc, bool is_cx);
+                   double multiplier, bool is_bust, bool is_otc, bool is_cx,
+                   double cm);
   void HandleFinish(bool is_buy, double leaves_qty, double price0,
                     double multiplier);
 };
@@ -39,6 +44,7 @@ struct Bod {
   double cx_qty = 0;
   double avg_px = 0;
   double realized_pnl = 0;
+  double commission = 0;
   time_t tm = 0;
   BrokerAccount::IdType broker_account_id = 0;
 };
@@ -69,6 +75,12 @@ class PositionManager : public Singleton<PositionManager> {
   }
   auto GetTargets(const SubAccount& acc) { return sub_targets_[acc.id]; }
 
+  struct Pnl {
+    double unrealized = 0;
+    double commission = 0;
+    double realized = 0;
+  };
+
  private:
   // holding the sql session exclusively for position update
   std::unique_ptr<soci::session> sql_;
@@ -82,12 +94,10 @@ class PositionManager : public Singleton<PositionManager> {
                                 Position>
       user_positions_;
   tbb::concurrent_unordered_map<BrokerAccount::IdType, TargetsPtr> sub_targets_;
-  struct Pnl {
-    double realized = 0;
-    double unrealized = 0;
+  struct PnlFile : public Pnl {
     std::ofstream* of = nullptr;
   };
-  tbb::concurrent_unordered_map<SubAccount::IdType, Pnl> pnls_;
+  tbb::concurrent_unordered_map<SubAccount::IdType, PnlFile> pnls_;
   std::string session_;
   friend class RiskMananger;
   friend class Connection;

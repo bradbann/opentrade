@@ -83,14 +83,23 @@ void Server::Publish(Confirmation::Ptr cm) {
   });
 }
 
-void Server::Publish(const SubAccount& acc, const std::string& msg) {
+void Server::Publish(const std::string& msg, const SubAccount* acc) {
 #ifdef BACKTEST
   return;
 #endif
-  kIoService->post([&acc, msg]() {
+  kIoService->post([msg, acc]() {
     LockGuard lock(kMutex);
     for (auto& pair : kSocketMap) {
-      pair.second->Send(acc, msg);
+      pair.second->Send(msg, acc);
+    }
+  });
+}
+
+void Server::Trigger(const std::string& cmd) {
+  kIoService->post([cmd]() {
+    LockGuard lock(kMutex);
+    for (auto& pair : kSocketMap) {
+      pair.second->OnMessageAsync(cmd);
     }
   });
 }
@@ -249,8 +258,8 @@ void Server::Start(int port, int nthreads) {
 
   ServeStatic();
 
-  kHttpServer.resource["^/api$"]["POST"] = [](ResponsePtr response,
-                                              RequestPtr request) {
+  kHttpServer.resource["^/api[/]$"]["POST"] = [](ResponsePtr response,
+                                                 RequestPtr request) {
     auto sessionToken = FindInMap(request->header, "session-token");
     std::make_shared<Connection>(
         std::make_shared<HttpWrapper>(response, request), kIoService)
@@ -265,12 +274,17 @@ void Server::Start(int port, int nthreads) {
   try {
     kWsServer.start();
     kHttpServer.start();
-    LOG_INFO("http://0.0.0.0:" << port << " starts to listen");
-    LOG_INFO("ws://0.0.0.0:" << port << "/ot"
-                             << " starts to listen");
+    LOG_INFO("http://0.0.0.0:" << port);
+    LOG_INFO("ws://0.0.0.0:" << port << "/ot/");
+    LOG_INFO("htpp://0.0.0.0:" << port << "/api/");
     std::vector<std::thread> threads;
     for (auto i = 0; i < nthreads; ++i) {
       threads.emplace_back([]() { kIoService->run(); });
+    }
+    if (fs::exists(fs::path("start.py"))) {
+      if (system(("nohup ./start.py " + std::to_string(port) + " &").c_str())) {
+        // bypass compile warn
+      }
     }
     for (auto& t : threads) t.join();
   } catch (std::runtime_error& e) {

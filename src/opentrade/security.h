@@ -32,16 +32,20 @@ struct Exchange : public ParamsBase {
     }
   };
   typedef std::vector<TickSizeTuple> TickSizeTable;
-  typedef std::shared_ptr<const TickSizeTable> TickSizeTablePtr;
-  TickSizeTablePtr tick_size_table() const { return tick_size_table_; }
+  typedef boost::shared_ptr<const TickSizeTable> TickSizeTablePtr;
+  TickSizeTablePtr tick_size_table() const {
+    return tick_size_table_.load(boost::memory_order_relaxed);
+  }
   double GetTickSize(double ref) const;
   int trade_start = 0;  // seconds since midnight
   int break_start = 0;
   int break_end = 0;
   int half_day = 0;
   typedef std::unordered_set<int> HalfDays;
-  typedef std::shared_ptr<const HalfDays> HalfDaysPtr;
-  HalfDaysPtr half_days() const { return half_days_; }
+  typedef boost::shared_ptr<const HalfDays> HalfDaysPtr;
+  HalfDaysPtr half_days() const {
+    return half_days_.load(boost::memory_order_relaxed);
+  }
 
   int GetSeconds() const {  // seconds since midnight in exchange time zone
     return opentrade::GetSeconds(utc_time_offset);
@@ -63,7 +67,7 @@ struct Exchange : public ParamsBase {
            (trade_start <= 0 || (t > trade_start && t < trade_end()));
   }
 
-  Security* Get(const std::string& name) {
+  Security* Get(const std::string& name) const {
     return FindInMap(security_of_name, name);
   }
 
@@ -82,8 +86,8 @@ struct Exchange : public ParamsBase {
 
  private:
   int trade_end_ = 0;
-  TickSizeTablePtr tick_size_table_;
-  HalfDaysPtr half_days_;
+  boost::atomic_shared_ptr<const TickSizeTable> tick_size_table_;
+  boost::atomic_shared_ptr<const HalfDays> half_days_;
 };
 
 // follow IB
@@ -152,14 +156,19 @@ class SecurityManager : public Singleton<SecurityManager> {
  public:
   static void Initialize();
   const char* check_sum() const { return check_sum_; }
-  const Security* Get(Security::IdType id) {
+  const Security* Get(Security::IdType id) const {
     return FindInMap(securities_, id);
   }
-  const Exchange* GetExchange(Exchange::IdType id) {
+  const Exchange* GetExchange(Exchange::IdType id) const {
     return FindInMap(exchanges_, id);
   }
-  const Exchange* GetExchange(const std::string& name) {
+  const Exchange* GetExchange(const std::string& name) const {
     return FindInMap(exchange_of_name_, name);
+  }
+  const Security* Get(const std::string& exch_name,
+                      const std::string& sec_name) const {
+    auto exch = GetExchange(exch_name);
+    return exch ? exch->Get(sec_name) : nullptr;
   }
 
   typedef tbb::concurrent_unordered_map<Security::IdType, Security*>

@@ -14,7 +14,7 @@ static const char* kApiVersion =
 #ifdef BACKTEST
     "backtest_"
 #endif
-    "1";
+    "1.3.1";
 
 class Adapter {
  public:
@@ -27,6 +27,7 @@ class Adapter {
   typedef Adapter* (*CFunc)();
   typedef std::function<Adapter*()> Func;
   Adapter* Clone() {
+    if (!create_func_) return this;
     auto inst = create_func_();
     inst->set_name(name());
     inst->set_config(config());
@@ -48,18 +49,32 @@ class Adapter {
 class NetworkAdapter : public Adapter {
  public:
   virtual void Reconnect() noexcept {}
+  virtual void Stop() noexcept = 0;
   virtual bool connected() const noexcept { return 1 == connected_; }
 
  protected:
   tbb::atomic<int> connected_ = 0;
 };
 
-template <typename T>
+inline const std::string kAdapterPrefixes[] = {"", "ec_", "md_", "cm_"};
+
+enum AdapterPrefix { kEmptyPrefix, kEcPrefix, kMdPrefix, kCmPrefix };
+
+template <typename T, AdapterPrefix prefix = kEmptyPrefix>
 class AdapterManager {
  public:
   typedef std::unordered_map<std::string, T*> AdapterMap;
-  void Add(T* adapter) { adapters_[adapter->name()] = adapter; }
-  T* GetAdapter(const std::string& name) { return FindInMap(adapters_, name); }
+  void AddAdapter(T* adapter) { adapters_[adapter->name()] = adapter; }
+  T* GetAdapter(const std::string& name) {
+    auto out = FindInMap(adapters_, name);
+    if (out) return out;
+    if constexpr (prefix > 0) {
+      auto& p = kAdapterPrefixes[prefix];
+      if (name.find(p) == 0) return {};
+      return FindInMap(adapters_, p + name);
+    }
+    return {};
+  }
   const AdapterMap& adapters() { return adapters_; }
 
  private:
