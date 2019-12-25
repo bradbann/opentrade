@@ -22,6 +22,8 @@
 #include "risk.h"
 #include "security.h"
 #include "server.h"
+#include "stop_book.h"
+#include "test_latency.h"
 
 namespace bpo = boost::program_options;
 namespace fs = boost::filesystem;
@@ -47,7 +49,6 @@ int main(int argc, char *argv[]) {
   std::string tick_file;
   auto start_date = 0u;
   auto end_date = 0u;
-  auto latency = 0.;
 #else
   auto io_threads = 0;
   auto port = 0;
@@ -68,8 +69,7 @@ int main(int argc, char *argv[]) {
             "start_date,s", bpo::value<uint32_t>(&start_date),
             "start date, in 'YYYYmmdd' format")(
             "end_date,e", bpo::value<uint32_t>(&end_date),
-            "end date, in 'YYYYmmdd' format")(
-            "latency,l", bpo::value<double>(&latency), "latency in seconds")
+            "end date, in 'YYYYmmdd' format")
 #else
         ("db_create_tables",
          bpo::value<bool>(&db_create_tables)->default_value(false),
@@ -109,6 +109,10 @@ int main(int argc, char *argv[]) {
     if (vm.count("help")) {
       std::cerr << config << std::endl;
       return 1;
+    }
+
+    if (!fs::exists(kStorePath)) {
+      fs::create_directory(kStorePath);
     }
 
     std::ifstream ifs(config_file_path.c_str());
@@ -156,10 +160,6 @@ int main(int argc, char *argv[]) {
     LOG_FATAL("Invalid start_date " << start_date);
   }
 #else
-  if (!fs::exists(kStorePath)) {
-    fs::create_directory(kStorePath);
-  }
-
   if (!fs::exists(kAlgoPath)) {
     fs::create_directory(kAlgoPath);
   }
@@ -210,8 +210,16 @@ int main(int argc, char *argv[]) {
     }
   }
 
+#ifdef TEST_LATENCY
+  ExchangeConnectivityManager::Instance().AddAdapter(
+      new opentrade::TestLatencyEc);
+  MarketDataManager::Instance().AddAdapterTmpl<opentrade::TestLatencyMd>();
+  AlgoManager::Instance().AddAdapterTmpl<opentrade::TestlatencyAlgo>();
+#endif
+
   AlgoManager::Initialize();
   opentrade::AccountManager::Initialize();
+  opentrade::StopBookManager::Initialize();
   PositionManager::Initialize();
   opentrade::GlobalOrderBook::Initialize();
 
@@ -257,8 +265,8 @@ int main(int argc, char *argv[]) {
   if (opentick_url.size())
     opentrade::OpenTick::Instance().Initialize(opentick_url);
 
-  AlgoManager::Instance().AddAdapter(new opentrade::BarHandler<>);
-  AlgoManager::Instance().AddAdapter(new opentrade::ConsolidationHandler);
+  AlgoManager::Instance().AddAdapterTmpl<opentrade::BarHandler<>>();
+  AlgoManager::Instance().AddAdapterTmpl<opentrade::ConsolidationHandler>();
 
   for (auto &p : MarketDataManager::Instance().adapters()) {
     p.second->Start();
@@ -274,7 +282,7 @@ int main(int argc, char *argv[]) {
 
 #ifdef BACKTEST
   auto &bt = opentrade::Backtest::Instance();
-  bt.Start(backtest_file, latency, tick_file);
+  bt.Start(backtest_file, tick_file);
   boost::gregorian::date dt(start_date / 10000, start_date % 10000 / 100,
                             start_date % 100);
   boost::gregorian::date end(end_date / 10000, end_date % 10000 / 100,
@@ -289,6 +297,9 @@ int main(int argc, char *argv[]) {
     LOG_FATAL("At least one market data adapter required");
     return -1;
   }
+#ifdef TEST_LATENCY
+  while (true) sleep(1);
+#endif
   // wait for some time to get last price updated
   // to-do: update last price from opentick
   auto wait = getenv("UPDATE_PNL_WAIT");

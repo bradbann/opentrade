@@ -31,6 +31,11 @@ if(UNIT_TEST)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DUNIT_TEST")
 endif()
 
+if(TEST_LATENCY)
+  message(STATUS "Building test_latency")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DTEST_LATENCY")
+endif()
+
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 find_path(QUICKFIX_INCLUDE_PATH quickfix/FixFields.h)
@@ -47,7 +52,10 @@ if(PQ_INCLUDE_PATH)
   message(STATUS "Found pq-dev")
   include_directories(${PQ_INCLUDE_PATH}/postgresql)
 else()
-  message(FATAL_ERROR "pq-dev not found.")
+  find_path(PQ_INCLUDE_PATH libpq-fe.h)
+  if(!PQ_INCLUDE_PATH)
+    message(FATAL_ERROR "pq-dev not found.")
+  endif()
 endif()
 
 find_path(SOCI_INCLUDE_PATH soci/soci.h)

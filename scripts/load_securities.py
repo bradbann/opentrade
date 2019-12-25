@@ -16,9 +16,10 @@ def main():
       '--db_url',
       help='sqlite3 file path or postgres url "host,database,user,password"')
   opts.add_option('-f', '--file', help='security symbol list file')
+  opts.add_option('', '--dry_run', action='store_true')
   opts = opts.parse_args()[0]
 
-  if not opts.db_url:
+  if not opts.db_url and not opts.dry_run:
     print('Error: --db_url not give')
     return
 
@@ -49,7 +50,7 @@ def main():
     # bbgids[r[1]] = r[0]
     symbols[str(r[2]) + ' ' + r[3]] = r[0]
 
-  df = pd.read_csv(opts.file)
+  df = pd.read_csv(opts.file, dtype={'symbol': object})
   cols = df.columns
   if 'exchange' not in cols or 'symbol' not in cols:
     print('exchange and symbol required in the csv')

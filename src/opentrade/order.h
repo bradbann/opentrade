@@ -6,8 +6,8 @@
 #include <any>
 #include <atomic>
 #include <fstream>
-#include <map>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 
@@ -17,12 +17,14 @@
 namespace opentrade {
 
 enum OrderSide : char {
+  kOrderSideUnknown = 0,
   kBuy = '1',
   kSell = '2',
   kShort = '5',
 };
 
 enum OrderType : char {
+  kOrderTypeUnknown = 0,
   kMarket = '1',
   kLimit = '2',
   kStop = '3',
@@ -31,7 +33,14 @@ enum OrderType : char {
   kCX = 'x',  // internal cross order
 };
 
+enum PositionEffect : char {
+  kPositionEffectUnknown = 0,
+  kClosePosition = 'C',
+  kOpenPosition = 'O',
+};
+
 enum OrderStatus : char {
+  kOrderStatusUnknown = 0,
   kNew = '0',
   kPartiallyFilled = '1',
   kFilled = '2',
@@ -52,9 +61,11 @@ enum OrderStatus : char {
   kUnconfirmedCancel = 'c',
   kUnconfirmedReplace = 'd',
   kCancelRejected = 'e',
+  kComment = '#',
 };
 
 enum TimeInForce : char {
+  kTimeInForceUnknonw = 0,
   kDay = '0',
   kGoodTillCancel = '1',     // GTC
   kAtTheOpening = '2',       // OPG
@@ -65,6 +76,7 @@ enum TimeInForce : char {
 };
 
 enum ExecTransType : char {
+  kExecTransTypeUnknown = 0,
   kTransNew = '0',
   kTransCancel = '1',
   kTransCorrect = '2',
@@ -75,6 +87,9 @@ static inline bool IsBuy(OrderSide side) { return side == kBuy; }
 static inline bool IsShort(OrderSide side) { return side == kShort; }
 
 struct Contract {
+#ifdef TEST_LATENCY
+  time_t tm_for_test_latency = 0;
+#endif
   double qty = 0;
   double price = 0;
   double stop_price = 0;
@@ -89,12 +104,16 @@ struct Contract {
   // one primary exchange have many venues (ECN or LP), you need to set
   // destination manually.
   std::string destination;
-  std::map<std::string,
-           std::variant<bool, int64_t, double, char, std::string, std::any>>*
-      optional = nullptr;
+  typedef std::unordered_map<
+      std::string,
+      std::variant<bool, int64_t, double, char, std::string, std::any>>
+      Option;
+  typedef std::shared_ptr<Option> OptionPtr;
+  OptionPtr optional;
   OrderSide side = kBuy;
   OrderType type = kLimit;
   TimeInForce tif = kDay;
+  PositionEffect position_effect = kPositionEffectUnknown;
 
   bool IsBuy() const { return opentrade::IsBuy(side); }
   bool IsShort() const { return opentrade::IsShort(side); }
@@ -103,7 +122,7 @@ struct Contract {
 class Instrument;
 
 struct Order : public Contract {
-  OrderStatus status = kUnconfirmedNew;
+  OrderStatus status = kOrderStatusUnknown;
 
   // in case inst of offline order is nullptr, for frontend only
   uint32_t algo_id = 0;
@@ -131,7 +150,7 @@ struct Confirmation {
   std::string exec_id;
   std::string order_id;
   std::string text;
-  OrderStatus exec_type = kUnconfirmedNew;
+  OrderStatus exec_type = kOrderStatusUnknown;
   ExecTransType exec_trans_type = kTransNew;
   union {
     double last_shares = 0;
@@ -140,7 +159,7 @@ struct Confirmation {
   double last_px = 0;
   int64_t transaction_time = 0;  // utc in microseconds
   uint32_t seq = 0;
-  typedef std::map<std::string, std::string> StrMap;
+  typedef std::unordered_map<std::string, std::string> StrMap;
   typedef std::shared_ptr<StrMap> StrMapPtr;
   StrMapPtr misc;
 };
@@ -162,6 +181,13 @@ class GlobalOrderBook : public Singleton<GlobalOrderBook> {
   void Handle(Confirmation::Ptr cm, bool offline = false);
   void LoadStore(uint32_t seq0 = 0, Connection* conn = nullptr);
   void ReadPreviousDayExecIds();
+  auto GetOrders(OrderStatus status) {
+    std::vector<Order*> out;
+    for (auto& pair : orders_) {
+      if (pair.second->status == status) out.push_back(pair.second);
+    }
+    return out;
+  }
 
  private:
   void UpdateOrder(Confirmation::Ptr cm);
@@ -188,6 +214,78 @@ static inline bool GetOrderSide(const std::string& side_str, OrderSide* side) {
   else
     return false;
   return true;
+}
+
+static inline const char* GetOrderSide(OrderSide c) {
+  auto side = "";
+  switch (c) {
+    case kBuy:
+      side = "buy";
+      break;
+    case kSell:
+      side = "sell";
+      break;
+    case kShort:
+      side = "short";
+      break;
+    default:
+      break;
+  }
+  return side;
+}
+
+static inline const char* GetOrderType(OrderType c) {
+  auto type = "";
+  switch (c) {
+    case kLimit:
+      type = "limit";
+      break;
+    case kMarket:
+      type = "market";
+      break;
+    case kStop:
+      type = "stop";
+      break;
+    case kStopLimit:
+      type = "stop_limit";
+      break;
+    case kOTC:
+      type = "otc";
+      break;
+    case kCX:
+      type = "cx";
+      break;
+    default:
+      break;
+  }
+  return type;
+}
+
+static inline const char* GetTif(TimeInForce c) {
+  auto tif = "";
+  switch (c) {
+    case kDay:
+      tif = "Day";
+      break;
+    case kImmediateOrCancel:
+      tif = "IOC";
+      break;
+    case kGoodTillCancel:
+      tif = "GTC";
+      break;
+    case kAtTheOpening:
+      tif = "OPG";
+      break;
+    case kFillOrKill:
+      tif = "FOK";
+      break;
+    case kGoodTillCrossing:
+      tif = "GTX";
+      break;
+    default:
+      break;
+  }
+  return tif;
 }
 
 }  // namespace opentrade

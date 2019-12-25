@@ -12,6 +12,7 @@
 #include "logger.h"
 #include "python.h"
 #include "server.h"
+#include "stop_book.h"
 
 namespace fs = boost::filesystem;
 
@@ -29,6 +30,11 @@ inline void AlgoRunner::operator()() {
       LockGuard lock(mutex_);
       if (dirties_.empty()) return;
       auto it = dirties_.begin();
+      static thread_local uint32_t kSeed = time(NULL);
+      if (dirties_.size() > 1) {
+        auto n = rand_r(&kSeed) % std::min(3lu, dirties_.size());
+        if (n > 0) std::advance(it, n);
+      }
       key = *it;
       dirties_.erase(it);
     }
@@ -82,7 +88,8 @@ void AlgoManager::Modify(Algo* algo, Algo::ParamMapPtr params) {
 
 Algo* AlgoManager::Spawn(Algo::ParamMapPtr params, const std::string& name,
                          const User& user, const std::string& params_raw,
-                         const std::string& token) {
+                         const std::string& token,
+                         Contract::OptionPtr optional) {
   Algo* algo = nullptr;
   if (params) {
     auto adapter = GetAdapter(name);
@@ -107,24 +114,48 @@ Algo* AlgoManager::Spawn(Algo::ParamMapPtr params, const std::string& name,
   }
   algo->user_ = &user;
   algo->token_ = token;
+  algo->is_active_ = true;  // for permanent in backtest
+  algo->optional_ = optional;
   algos_.emplace(algo->id_, algo);
   if (!token.empty()) algo_of_token_.emplace(token, algo);
+  std::string disabled;
+  user.CheckDisabled("user", &disabled);
   if (params) {
     for (auto& pair : *params) {
       if (auto pval = std::get_if<SecurityTuple>(&pair.second)) {
-        if (pval->acc && pval->sec) {
-          algos_of_sec_acc_.insert(std::make_pair(
-              std::make_pair(pval->sec->id, pval->acc->id), algo));
+        if (pval->acc) {
+          if (disabled.empty())
+            pval->acc->CheckDisabled("sub_account", &disabled);
+          if (pval->sec) {
+            if (disabled.empty()) {
+              auto broker =
+                  pval->acc->GetBrokerAccount(pval->sec->exchange->id);
+              if (broker) broker->CheckDisabled("broker_account", &disabled);
+            }
+            if (disabled.empty()) {
+              StopBookManager::Instance().CheckStop(*pval->sec, pval->acc,
+                                                    &disabled);
+            }
+            algos_of_sec_acc_.insert(std::make_pair(
+                std::make_pair(pval->sec->id, pval->acc->id), algo));
+          }
         }
       }
     }
   }
   if (dynamic_cast<IndicatorHandler*>(algo)) return algo;
   Persist(*algo, "new", params ? params_raw : "{\"test\":true}");
-  algo->Async([params, algo]() {
-    kError = params ? algo->OnStart(*params.get()) : algo->Test();
+  algo->Async([params, algo, disabled]() {
+    if (!disabled.empty()) {
+      kError = disabled;
+    } else {
+      kError = params ? algo->OnStart(*params.get()) : algo->Test();
+    }
     if (!kError.empty()) {
       algo->Stop();
+#ifdef BACKTEST
+      LOG_ERROR(kError);
+#endif
     }
     kError.clear();
   });
@@ -185,9 +216,13 @@ void AlgoManager::Run(int nthreads) {
 
 void AlgoManager::StartPermanents() {
   for (auto& pair : adapters()) {
-    if (pair.first.at(0) != '_' &&
-        !dynamic_cast<IndicatorHandler*>(pair.second))
-      continue;
+    auto ih = dynamic_cast<IndicatorHandler*>(pair.second);
+    if (pair.first.at(0) != '_' && !ih) continue;
+#ifdef BACKTEST
+    if (ih) {
+      assert(ih->create_func());
+    }
+#endif
     auto user_name = pair.second->config("user");
     auto user = AccountManager::Instance().GetUser(user_name);
     auto algo = Spawn(std::make_shared<Algo::ParamMap>(), pair.first,
@@ -201,13 +236,13 @@ void AlgoManager::StartPermanents() {
 
   for (auto& pair : algos_) {
     auto ih = dynamic_cast<IndicatorHandler*>(pair.second);
-    if (!ih) return;
+    if (!ih) continue;
     IndicatorHandlerManager::Instance().Register(ih);
   }
 
   for (auto& pair : algos_) {
     auto ih = dynamic_cast<IndicatorHandler*>(pair.second);
-    if (!ih) return;
+    if (!ih) continue;
     ih->Async([ih]() { ih->OnStart(); });
   }
 }
@@ -315,9 +350,16 @@ void AlgoManager::Stop(const std::string& token) {
 }
 
 void AlgoManager::Stop(Security::IdType sec, SubAccount::IdType acc) {
-  auto range = algos_of_sec_acc_.equal_range(std::make_pair(sec, acc));
-  for (auto it = range.first; it != range.second; ++it) {
-    if (it->second->is_active()) Stop(it->second->id());
+  if (sec > 0) {
+    auto range = algos_of_sec_acc_.equal_range(std::make_pair(sec, acc));
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second->is_active()) Stop(it->second->id());
+    }
+  } else {
+    for (auto& pair : algos_of_sec_acc_) {
+      if (pair.first.second == acc && pair.second->is_active())
+        Stop(pair.second->id());
+    }
   }
 }
 
@@ -456,6 +498,7 @@ Order* Algo::Place(const Contract& contract, Instrument* inst) {
   ord->user = user_;
   ord->inst = inst;
   ord->sec = &inst->sec();
+  if (!contract.optional && optional_) ord->optional = optional_;
   auto ok = ExchangeConnectivityManager::Instance().Place(ord);
   if (!ok) return nullptr;
   if (contract.type == kCX) return ord;

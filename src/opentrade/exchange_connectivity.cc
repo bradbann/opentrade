@@ -80,7 +80,7 @@ static inline void HandleConfirmation(
   auto cm = std::make_shared<Confirmation>();
   cm->order = ord;
   cm->exec_type = is_partial ? kPartiallyFilled : kFilled;
-  cm->last_shares = qty;
+  cm->last_shares = Round6(qty);
   cm->last_px = price;
   cm->exec_id = exec_id;
   cm->exec_trans_type = exec_trans_type;
@@ -99,7 +99,7 @@ void ExchangeConnectivityManager::HandleFilled(Order* ord, double qty,
 static inline auto CheckAdapter(Order* ord) {
   auto adapter = ord->broker_account->adapter;
   auto name = ord->broker_account->adapter_name;
-  if (!ord->destination.empty()) {
+  if (!adapter && !ord->destination.empty()) {
     name = ord->destination.c_str();
     adapter = ExchangeConnectivityManager::Instance().GetAdapter(name);
   }
@@ -120,6 +120,8 @@ static inline auto CheckAdapter(Order* ord) {
 
 bool ExchangeConnectivityManager::Place(Order* ord) {
   assert(ord->qty > 0);
+  ord->qty = Round6(ord->qty);
+  if (ord->qty <= 0) return false;
   kRiskError.clear();
   assert(ord->sub_account);
   assert(ord->sec);
@@ -135,29 +137,28 @@ bool ExchangeConnectivityManager::Place(Order* ord) {
     HandleConfirmation(ord, kRiskRejected, kRiskError);
     return false;
   }
-  auto exchange = ord->sec->exchange;
-  auto broker = ord->sub_account->GetBrokerAccount(exchange->id);
-  if (!broker) {
-    char buf[256];
-    snprintf(buf, sizeof(buf), "Not permissioned to trade on exchange: %s",
-             exchange->name);
-    kRiskError = buf;
-    HandleConfirmation(ord, kRiskRejected, kRiskError);
-    return false;
+  if (!ord->broker_account) {
+    auto exchange = ord->sec->exchange;
+    auto broker = ord->sub_account->GetBrokerAccount(exchange->id);
+    if (!broker) {
+      char buf[256];
+      snprintf(buf, sizeof(buf), "Not permissioned to trade on exchange: %s",
+               exchange->name);
+      kRiskError = buf;
+      HandleConfirmation(ord, kRiskRejected, kRiskError);
+      return false;
+    }
+    ord->broker_account = broker;
   }
-  ord->broker_account = broker;
-  ord->leaves_qty = ord->qty;
   if (ord->type == kOTC) {
-    ord->id = GlobalOrderBook::Instance().NewOrderId();
     HandleConfirmation(ord, kUnconfirmedNew);
     HandleConfirmation(ord, ord->qty, ord->price,
                        "OTC-" + std::to_string(ord->id), NowUtcInMicro(), false,
                        kTransNew);
     return true;
   } else if (ord->type == kCX) {
-    ord->id = GlobalOrderBook::Instance().NewOrderId();
-    CrossEngine::Instance().Place(static_cast<CrossOrder*>(ord));
     HandleConfirmation(ord, kUnconfirmedNew);
+    CrossEngine::Instance().Place(static_cast<CrossOrder*>(ord));
     return true;
   }
   auto adapter = CheckAdapter(ord);
@@ -171,6 +172,7 @@ bool ExchangeConnectivityManager::Place(Order* ord) {
         return false;
       }
     }
+    if (ord->type == kMarket) ord->tif = kImmediateOrCancel;
   } else if (ord->price <= 0) {
     kRiskError = "Price can not be empty for limit order";
     HandleConfirmation(ord, kRiskRejected, kRiskError);
@@ -180,8 +182,6 @@ bool ExchangeConnectivityManager::Place(Order* ord) {
     HandleConfirmation(ord, kRiskRejected, kRiskError);
     return false;
   }
-  ord->id = GlobalOrderBook::Instance().NewOrderId();
-  ord->tm = NowUtcInMicro();
   HandleConfirmation(ord, kUnconfirmedNew, "", ord->tm);
   kRiskError = adapter->Place(*ord);
   auto ok = kRiskError.empty();
@@ -194,8 +194,8 @@ bool ExchangeConnectivityManager::Place(Order* ord) {
 
 static inline bool Cancel(Order* cancel_order) {
   kRiskError.clear();
-  cancel_order->tm = NowUtcInMicro();
-  if (!RiskManager::Instance().CheckMsgRate(*cancel_order)) {
+  if (!RiskManager::Instance().CheckMsgRate(*cancel_order) ||
+      !RiskManager::Instance().CheckCancels(*cancel_order)) {
     HandleConfirmation(cancel_order, kRiskRejected, kRiskError);
     static uint32_t seed;
     kTimerTaskPool.AddTask(
@@ -206,7 +206,6 @@ static inline bool Cancel(Order* cancel_order) {
   auto adapter = CheckAdapter(cancel_order);
   if (!adapter) return false;
   HandleConfirmation(cancel_order, kUnconfirmedCancel, "", cancel_order->tm);
-  cancel_order->id = GlobalOrderBook::Instance().NewOrderId();
   kRiskError = adapter->Cancel(*cancel_order);
   auto ok = kRiskError.empty();
   if (!ok)
@@ -233,7 +232,8 @@ bool ExchangeConnectivityManager::Cancel(const Order& orig_ord) {
   if (!orig_ord.broker_account) return false;
   auto cancel_order = new Order(orig_ord);
   cancel_order->orig_id = orig_ord.id;
-  cancel_order->status = kUnconfirmedCancel;
+  cancel_order->id = 0;
+  cancel_order->status = kOrderStatusUnknown;
   return opentrade::Cancel(cancel_order);
 }
 
@@ -309,6 +309,12 @@ void ExchangeConnectivityAdapter::HandleOthers(Order::IdType id,
                                                const std::string& text,
                                                int64_t transaction_time) {
   Handle(name(), id, exec_type, exec_type, text, transaction_time);
+}
+
+void ExchangeConnectivityManager::ClearUnformed(int offset) {
+  for (auto& ord : GlobalOrderBook::Instance().GetOrders(kUnconfirmedNew)) {
+    if (ord->tm > offset) HandleConfirmation(ord, kDoneForDay);
+  }
 }
 
 }  // namespace opentrade

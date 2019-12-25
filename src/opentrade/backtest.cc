@@ -1,6 +1,7 @@
 #ifdef BACKTEST
-
 #include "backtest.h"
+
+#include <boost/iostreams/device/mapped_file.hpp>
 
 #include "cross_engine.h"
 #include "indicator_handler.h"
@@ -10,69 +11,6 @@
 namespace fs = boost::filesystem;
 
 namespace opentrade {
-
-decltype(auto) GetSecurities(std::ifstream& ifs, const std::string& fn) {
-  std::string line;
-  if (!std::getline(ifs, line)) {
-    LOG_FATAL("Invalid file: " << fn);
-  }
-  char a[256];
-  *a = 0;
-  char b[256];
-  *b = 0;
-  std::vector<const Security*> out;
-  if (sscanf(line.c_str(), "%s %s", a, b) != 2 || strcasecmp(a, "@begin")) {
-    LOG_FATAL("Invalid file: " << fn);
-  }
-  std::unordered_map<std::string, const Security*> sec_map;
-  if (!strcasecmp(b, "bbgid")) {
-    for (auto& pair : SecurityManager::Instance().securities()) {
-      if (*pair.second->bbgid) sec_map[pair.second->bbgid] = pair.second;
-    }
-  } else if (!strcasecmp(b, "isin")) {
-    for (auto& pair : SecurityManager::Instance().securities()) {
-      if (*pair.second->isin) sec_map[pair.second->isin] = pair.second;
-    }
-  } else if (!strcasecmp(b, "cusip")) {
-    for (auto& pair : SecurityManager::Instance().securities()) {
-      if (*pair.second->cusip) sec_map[pair.second->cusip] = pair.second;
-    }
-  } else if (!strcasecmp(b, "sedol")) {
-    for (auto& pair : SecurityManager::Instance().securities()) {
-      if (*pair.second->sedol) sec_map[pair.second->sedol] = pair.second;
-    }
-  } else if (!strcasecmp(b, "id")) {
-    for (auto& pair : SecurityManager::Instance().securities()) {
-      sec_map[std::to_string(pair.second->id)] = pair.second;
-    }
-  } else if (!strcasecmp(b, "symbol")) {
-    for (auto& pair : SecurityManager::Instance().securities()) {
-      sec_map[std::string(pair.second->exchange->name) + " " +
-              pair.second->symbol] = pair.second;
-    }
-  } else if (!strcasecmp(b, "local_symbol")) {
-    for (auto& pair : SecurityManager::Instance().securities()) {
-      if (*pair.second->local_symbol)
-        sec_map[std::string(pair.second->exchange->name) + " " +
-                pair.second->local_symbol] = pair.second;
-    }
-  } else {
-    LOG_FATAL("Invalid file: " << fn);
-  }
-
-  while (std::getline(ifs, line)) {
-    if (!strcasecmp(line.c_str(), "@end")) break;
-    auto sec = sec_map[line];
-    out.push_back(sec);
-    if (!sec) {
-      LOG_ERROR("Unknown security on line " << line << " of " << fn);
-      continue;
-    }
-  }
-  LOG_INFO(out.size() << " securities in " << fn);
-
-  return out;
-}
 
 struct SecTuple {
   const Security* sec;
@@ -93,14 +31,20 @@ struct Tick {
 };
 typedef std::vector<Tick> Ticks;
 
-bool LoadTickFile(const std::string& fn, Simulator* sim,
+bool LoadTickFile(const char* fn, Simulator* sim,
                   const boost::gregorian::date& date, SecTuples* sts,
-                  std::ifstream& ifs) {
-  ifs.open(fn);
-  if (!ifs.good()) return false;
+                  PipeStream* ifs, bool* binary,
+                  const std::set<std::string>& used_symbols) {
+  *binary = true;
+  ifs->open(fn);
+  if (!ifs->good()) return false;
 
   LOG_INFO("Loading " << fn);
-  auto secs0 = GetSecurities(ifs, fn);
+  auto secs0 = opentrade::SecurityManager::Instance().GetSecurities(
+      &ifs->stream(), fn, binary, used_symbols);
+  if (*binary && ifs->pipe()) {
+    LOG_FATAL("Not support compressed tick file");
+  }
   sts->clear();
   sts->resize(secs0.size());
   auto date_num = date.year() * 10000 + date.month() * 100 + date.day();
@@ -119,26 +63,53 @@ bool LoadTickFile(const std::string& fn, Simulator* sim,
   return true;
 }
 
-Tick ReadTickFile(std::ifstream& ifs, uint32_t to_tm, SecTuples* sts,
-                  Ticks* ticks) {
-  std::string line;
-  while (std::getline(ifs, line)) {
+inline Tick ReadTextTickFile(std::basic_istream<char>* ifs, uint32_t to_tm,
+                             SecTuples* sts, Ticks* ticks) {
+  static const int kLineLength = 128;
+  char line[kLineLength];
+  while (ifs->getline(line, sizeof(line))) {
     Tick t;
     uint32_t i;
     uint32_t hmsm;
-    if (sscanf(line.c_str(), "%u %u %c %lf %lf", &hmsm, &i, &t.type, &t.px,
-               &t.qty) != 5)
+    if (sscanf(line, "%u %u %c %lf %lf", &hmsm, &i, &t.type, &t.px, &t.qty) !=
+        5)
       continue;
     if (i >= sts->size()) continue;
     auto& st = (*sts)[i];
     if (!st.sec) continue;
     t.st = &st;
     t.px *= st.adj_px;
-    if (!t.px) continue;
     t.qty *= st.adj_vol;
     auto hms = hmsm / 1000;
     t.ms = (hms / 10000 * 3600 + hms % 10000 / 100 * 60 + hms % 100) * 1000 +
            hmsm % 1000;
+    if (t.ms > to_tm) return t;
+    ticks->push_back(t);
+  }
+  return {};
+}
+
+inline Tick ReadBinaryTickFile(const char** pp, const char* p_end,
+                               uint32_t to_tm, SecTuples* sts, Ticks* ticks) {
+  auto& p = *pp;
+  while (p < p_end) {
+    Tick t;
+    t.ms = *reinterpret_cast<const uint32_t*>(p);
+    p += 4;
+    auto i = *reinterpret_cast<const uint16_t*>(p);
+    p += 2;
+    t.type = *p;
+    p += 1;
+    t.px = *reinterpret_cast<const double*>(p);
+    p += 8;
+    t.qty = *reinterpret_cast<const uint32_t*>(p);
+    p += 4;
+    if (i >= sts->size()) continue;
+    auto& st = (*sts)[i];
+    if (!st.sec) continue;
+    t.st = &st;
+    t.px *= st.adj_px;
+    t.qty *= st.adj_vol;
     if (t.ms > to_tm) return t;
     ticks->push_back(t);
   }
@@ -158,16 +129,33 @@ void Backtest::Play(const boost::gregorian::date& date) {
   }
 
   char fn[256];
-  std::vector<SecTuples> sts(simulators_.size());
-  std::vector<std::ifstream> ifs(simulators_.size());
+  SecTuples sts[simulators_.size()];
+  PipeStream ifs[simulators_.size()];
+  bool binaries[simulators_.size()];
+  std::vector<std::pair<const char*, const char*>> fpos(simulators_.size());
+  boost::iostreams::mapped_file_source mmfiles[simulators_.size()];
   auto n = 0;
   for (auto i = 0u; i < simulators_.size(); ++i) {
     strftime(fn, sizeof(fn), simulators_[i].first.c_str(), &tm);
-    if (LoadTickFile(fn, simulators_[i].second, date, &sts[i], ifs[i])) ++n;
+    if (LoadTickFile(fn, simulators_[i].second, date, &sts[i], &ifs[i],
+                     &binaries[i], used_symbols_)) {
+      LOG_DEBUG("Start to play back " << fn);
+      if (binaries[i]) {
+        mmfiles[i].open(fn);
+        auto p = mmfiles[i].data();
+        auto p_end = p + mmfiles[i].size();
+        p += ifs[i].tellg();
+        ifs[i].close();
+        if ((p_end - p) % 19) {
+          LOG_FATAL("Invalid binary file: " << fn);
+        }
+        fpos[i] = std::make_pair(p, p_end);
+      }
+      ++n;
+    }
   }
   if (!n) return;
 
-  LOG_DEBUG("Start to play back " << fn);
   AlgoManager::Instance().StartPermanents();
   if (on_start_of_day_) {
     try {
@@ -178,11 +166,6 @@ void Backtest::Play(const boost::gregorian::date& date) {
     }
   }
 
-  trade_hit_ratio_ = 0.5;
-  auto trade_hit_ratio_str = getenv("TRADE_HIT_RATIO");
-  if (trade_hit_ratio_str) {
-    trade_hit_ratio_ = atof(trade_hit_ratio_str);
-  }
   std::vector<Tick> last_ticks(simulators_.size());
   static const uint32_t kNSteps = 240;
   static const uint32_t kStep = (kSecondsOneDay * 1000) / kNSteps;
@@ -196,7 +179,10 @@ void Backtest::Play(const boost::gregorian::date& date) {
         if (t.ms > to_tm) continue;
         ticks.push_back(t);
       }
-      t = ReadTickFile(ifs[i], to_tm, &sts[i], &ticks);
+      t = binaries[i]
+              ? ReadBinaryTickFile(&fpos[i].first, fpos[i].second, to_tm,
+                                   &sts[i], &ticks)
+              : ReadTextTickFile(&ifs[i].stream(), to_tm, &sts[i], &ticks);
     }
     if (simulators_.size() > 1) std::sort(ticks.begin(), ticks.end());
     for (auto& t : ticks) {
@@ -235,7 +221,7 @@ void Backtest::Clear() {
   auto& algo_mngr = AlgoManager::Instance();
   for (auto& pair : algo_mngr.algos_) {
     pair.second->Stop();
-    delete pair.second;
+    if (pair.second->create_func()) delete pair.second;
   }
   algo_mngr.runners_[0].dirties_.clear();
   algo_mngr.runners_[0].instruments_.clear();
@@ -251,6 +237,7 @@ void Backtest::Clear() {
   for (auto& pair : simulators_) pair.second->active_orders().clear();
   kTimers.clear();
   IndicatorHandlerManager::Instance().ihs_.clear();
+  IndicatorHandlerManager::Instance().name2id_.clear();
   for (auto& pair : simulators_) {
     pair.second->ResetData();
   }
@@ -304,10 +291,9 @@ SubAccount* Backtest::CreateSubAccount(const std::string& name,
   return s;
 }
 
-void Backtest::Start(const std::string& py, double latency,
+void Backtest::Start(const std::string& py,
                      const std::string& default_tick_file) {
   obj_ = bp::object(bp::ptr(this));
-  latency_ = latency;
 
   for (auto& pair : SecurityManager::Instance().securities()) {
     pair.second->close_price = 0;
@@ -334,12 +320,31 @@ void Backtest::Start(const std::string& py, double latency,
   on_start_ = GetCallable(m, "on_start");
   on_start_of_day_ = GetCallable(m, "on_start_of_day");
   on_end_ = GetCallable(m, "on_end");
+  if (!on_end_) on_end_ = GetCallable(m, "on_stop");
   on_end_of_day_ = GetCallable(m, "on_end_of_day");
   if (!on_start_) return;
   try {
     on_start_(obj_);
   } catch (const bp::error_already_set& err) {
     PrintPyError("on_start", true);
+  }
+
+  auto trade_hit_ratio_str = getenv("TRADE_HIT_RATIO");
+  if (trade_hit_ratio_str) {
+    trade_hit_ratio_ = atof(trade_hit_ratio_str);
+  }
+  LOG_INFO("TRADE_HIT_RATIO=" << trade_hit_ratio_);
+
+  auto latency_str = getenv("LATENCY");
+  if (latency_str) {
+    latency_ = atof(latency_str);
+  }
+  LOG_INFO("LATENCY=" << latency_);
+
+  auto used_symbols_str = getenv("USED_SYMBOLS");
+  if (used_symbols_str) {
+    for (auto& str : Split(used_symbols_str, ",")) used_symbols_.insert(str);
+    LOG_INFO("USED_SYMBOLS=" << used_symbols_str);
   }
 }
 

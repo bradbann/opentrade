@@ -10,10 +10,10 @@
 #include <fstream>
 #include <list>
 #include <mutex>
-#include <set>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -32,8 +32,9 @@ struct SecurityTuple {
   DataSrc src;
   const Security* sec = nullptr;
   const SubAccount* acc = nullptr;
-  OrderSide side = kBuy;
+  OrderSide side = kOrderSideUnknown;
   double qty = 0;
+  PositionEffect position_effect = kPositionEffectUnknown;
 };
 
 struct ParamDef {
@@ -94,6 +95,7 @@ class Algo : public Adapter {
   IdType id() const { return id_; }
   const std::string& token() const { return token_; }
   const User& user() const { return *user_; }
+  void set_user(const User* user) { user_ = user; }
 
  protected:
   Instrument* Subscribe(const Security& sec, DataSrc src = {},
@@ -108,16 +110,17 @@ class Algo : public Adapter {
   bool is_active_ = true;
   IdType id_ = 0;
   std::string token_;
-  std::set<Instrument*> instruments_;
+  std::unordered_set<Instrument*> instruments_;
+  Contract::OptionPtr optional_;
   friend class AlgoManager;
   friend class Backtest;
 };
 
 class Instrument {
  public:
-  typedef std::set<Order*> Orders;
-  Instrument(Algo* algo, const Security& sec, DataSrc src)
-      : algo_(algo), sec_(sec), src_(src) {}
+  typedef std::unordered_set<Order*> Orders;
+  Instrument(Algo* algo, const Security& sec, DataSrc src, uint8_t src_idx = 0)
+      : algo_(algo), sec_(sec), src_(src), src_idx_(src_idx) {}
   Algo& algo() { return *algo_; }
   const Algo& algo() const { return *algo_; }
   const Instrument* parent() const { return parent_; }
@@ -130,18 +133,18 @@ class Instrument {
   double sold_qty() const { return sold_qty_; }
   double outstanding_buy_qty() const { return outstanding_buy_qty_; }
   double outstanding_sell_qty() const { return outstanding_sell_qty_; }
-  double net_qty() const { return bought_qty_ - sold_qty_; }
-  double net_cx_qty() const { return bought_cx_qty_ - sold_cx_qty_; }
-  double total_qty() const { return bought_qty_ + sold_qty_; }
-  double total_cx_qty() const { return bought_cx_qty_ + sold_cx_qty_; }
+  double net_qty() const { return Round6(bought_qty_ - sold_qty_); }
+  double net_cx_qty() const { return Round6(bought_cx_qty_ - sold_cx_qty_); }
+  double total_qty() const { return Round6(bought_qty_ + sold_qty_); }
+  double total_cx_qty() const { return Round6(bought_cx_qty_ + sold_cx_qty_); }
   double net_outstanding_qty() const {
-    return outstanding_buy_qty_ - outstanding_sell_qty_;
+    return Round6(outstanding_buy_qty_ - outstanding_sell_qty_);
   }
   double total_outstanding_qty() const {
-    return outstanding_buy_qty_ + outstanding_sell_qty_;
+    return Round6(outstanding_buy_qty_ + outstanding_sell_qty_);
   }
   double total_exposure() const {
-    return total_qty() - total_cx_qty() + total_outstanding_qty();
+    return Round6(total_qty() - total_cx_qty() + total_outstanding_qty());
   }
   size_t id() const { return id_; }
 
@@ -219,7 +222,7 @@ class AlgoManager : public AdapterManager<Algo>, public Singleton<AlgoManager> {
   static void Initialize();
   Algo* Spawn(Algo::ParamMapPtr params, const std::string& name,
               const User& user, const std::string& params_raw,
-              const std::string& token);
+              const std::string& token, Contract::OptionPtr optional = {});
   template <typename T>
   void Modify(const T& id, Algo::ParamMapPtr params) {
     Modify(Get(id), params);

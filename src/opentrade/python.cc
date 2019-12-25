@@ -166,10 +166,10 @@ BOOST_PYTHON_MODULE(opentrade) {
       .value("gtd", kGoodTillDate);
 
   bp::class_<DataSrc>("DataSrc", bp::init<const char *>())
-      .def("__str__", &DataSrc::str);
+      .def("__repr__", &DataSrc::str);
 
   bp::class_<SubAccount, boost::noncopyable>("SubAccount", bp::no_init)
-      .def("__str__",
+      .def("__repr__",
            +[](const SubAccount &acc) { return std::string(acc.name); })
       .add_property(
           "positions",
@@ -186,8 +186,25 @@ BOOST_PYTHON_MODULE(opentrade) {
       .def_readonly("id", &SubAccount::id)
       .def_readonly("name", &SubAccount::name);
 
+  bp::class_<User, boost::noncopyable>("User", bp::no_init)
+      .def("__repr__", +[](const User &user) { return std::string(user.name); })
+      .add_property(
+          "positions",
+          +[](const User &user) {
+            bp::list out;
+            for (auto &pair : PositionManager::Instance().user_positions()) {
+              if (pair.first.first != user.id) continue;
+              auto sec = SecurityManager::Instance().Get(pair.first.second);
+              out.append(bp::make_tuple(bp::object(bp::ptr(sec)),
+                                        bp::object(bp::ptr(&pair.second))));
+            }
+            return out;
+          })
+      .def_readonly("id", &User::id)
+      .def_readonly("name", &User::name);
+
   bp::class_<Exchange, boost::noncopyable>("Exchange", bp::no_init)
-      .def("__str__", +[](const Exchange &ex) { return std::string(ex.name); })
+      .def("__repr__", +[](const Exchange &ex) { return std::string(ex.name); })
       .def_readonly("name", &Exchange::name)
       .def_readonly("mic", &Exchange::mic)
       .def_readonly("bb_name", &Exchange::bb_name)
@@ -213,26 +230,32 @@ BOOST_PYTHON_MODULE(opentrade) {
       });
 
   bp::class_<Position>("Position", bp::no_init)
-      .def("__str__",
+      .def("__repr__",
            +[](const Position &p) {
              std::stringstream ss;
-             ss << "qty=" << p.qty << ", avg_px=" << p.avg_px
+             ss << "Position(qty=" << p.qty << ", avg_px=" << p.avg_px
                 << ", total_bought_qty=" << p.total_bought_qty
                 << ", total_sold_qty=" << p.total_sold_qty
+                << ", total_bought=" << p.total_bought
+                << ", total_sold=" << p.total_sold
                 << ", total_outstanding_buy_qty=" << p.total_outstanding_buy_qty
                 << ", total_outstanding_sell_qty="
                 << p.total_outstanding_sell_qty
                 << ", unrealized_pnl=" << p.unrealized_pnl
-                << ", realized_pnl=" << p.realized_pnl;
+                << ", commission=" << p.commission
+                << ", realized_pnl=" << p.realized_pnl << ")";
              return ss.str();
            })
       .def_readonly("qty", &Position::qty)
       .def_readonly("cx_qty", &Position::cx_qty)
       .def_readonly("avg_px", &Position::avg_px)
       .def_readonly("unrealized_pnl", &Position::unrealized_pnl)
+      .def_readonly("commission", &Position::commission)
       .def_readonly("realized_pnl", &Position::realized_pnl)
       .def_readonly("total_bought_qty", &Position::total_bought_qty)
       .def_readonly("total_sold_qty", &Position::total_sold_qty)
+      .def_readonly("total_bought", &Position::total_bought)
+      .def_readonly("total_sold", &Position::total_sold)
       .def_readonly("total_outstanding_buy_qty",
                     &Position::total_outstanding_buy_qty)
       .def_readonly("total_outstanding_sell_qty",
@@ -240,11 +263,11 @@ BOOST_PYTHON_MODULE(opentrade) {
 
   auto cls = bp::class_<Security, boost::noncopyable>("Security", bp::no_init);
   cls.def_readonly("id", &Security::id)
-      .def("__str__",
+      .def("__repr__",
            +[](const Security &s) {
              std::stringstream ss;
-             ss << "symbol=" << s.symbol
-                << ", exchange=" << (s.exchange ? s.exchange->name : "");
+             ss << "Security(symbol=" << s.symbol
+                << ", exchange=" << (s.exchange ? s.exchange->name : "") << ")";
              return ss.str();
            })
       .def_readonly("symbol", &Security::symbol)
@@ -296,6 +319,13 @@ BOOST_PYTHON_MODULE(opentrade) {
                         : nullptr;
            },
            bp::return_internal_reference<>())
+      .def("get_user_position",
+           +[](const Security &sec, const User *user) {
+             if (!user) return (const Position *)nullptr;
+             return user ? &PositionManager::Instance().Get(*user, sec)
+                         : nullptr;
+           },
+           bp::return_internal_reference<>())
 #ifdef BACKTEST
       .def("set_adj",
            +[](Security &sec, bp::object adjs) {
@@ -317,22 +347,18 @@ BOOST_PYTHON_MODULE(opentrade) {
       .def_readonly("local_symbol", &Security::local_symbol);
 
   bp::class_<SecurityTuple>("SecurityTuple")
-      .def("__str__",
+      .def("__repr__",
            +[](const SecurityTuple &st) {
              std::stringstream ss;
-             ss << "src=" << st.src.str() << ", side="
+             ss << "SecurityTuple(src=" << st.src.str() << ", side="
                 << bp::extract<const char *>(
                        bp::str(bp::object(bp::ptr(&st)).attr("side")))
                 << ", qty=" << st.qty << ", sec=("
                 << bp::extract<const char *>(
                        bp::str(bp::object(bp::ptr(&st)).attr("sec")))
                 << ")"
-                << ", acc=" << (st.acc ? st.acc->name : "");
+                << ", acc=" << (st.acc ? st.acc->name : "") << ")";
              return ss.str();
-           })
-      .def("__repr__",
-           +[](const SecurityTuple &st) {
-             return bp::str(bp::object(bp::ptr(&st)));
            })
       .def_readwrite("src", &SecurityTuple::src)
       .def_readwrite("side", &SecurityTuple::side)
@@ -364,8 +390,8 @@ BOOST_PYTHON_MODULE(opentrade) {
       .def_readwrite("tif", &Contract::tif)
       .def_readwrite("type", &Contract::type);
 
-  bp::class_<MarketData::Trade>("Bar", bp::no_init)
-      .def_readonly("tm", &MarketData::Trade::tm)
+  bp::class_<Bar>("Bar", bp::no_init)
+      .def_readonly("tm", &Bar::tm)
       .def_readonly("open", &MarketData::Trade::open)
       .def_readonly("high", &MarketData::Trade::high)
       .def_readonly("low", &MarketData::Trade::low)
@@ -373,11 +399,11 @@ BOOST_PYTHON_MODULE(opentrade) {
       .def_readonly("qty", &MarketData::Trade::qty)
       .def_readonly("volume", &MarketData::Trade::volume)
       .def_readonly("vwap", &MarketData::Trade::vwap)
-      .def("__str__", +[](const MarketData::Trade &t) {
+      .def("__repr__", +[](const Bar &t) {
         std::stringstream ss;
-        ss << "tm=" << t.tm << ", open=" << t.open << ", high=" << t.high
+        ss << "Bar(tm=" << t.tm << ", open=" << t.open << ", high=" << t.high
            << ", low=" << t.low << ", close=" << t.close << ", qty=" << t.qty
-           << ", volume=" << t.volume << ", vwap=" << t.vwap;
+           << ", volume=" << t.volume << ", vwap=" << t.vwap << ")";
         return ss.str();
       });
 
@@ -503,14 +529,30 @@ BOOST_PYTHON_MODULE(opentrade) {
       .def("stop", &Python::Stop)
       .def("cross", &Python::Cross)
       .def("set_timeout", &Python::SetTimeout)
+      .add_property("user",
+                    bp::make_function(+[](Algo &algo) { return &algo.user(); },
+                                      bp::return_internal_reference<>()))
       .add_property("id", &Algo::id)
       .add_property("name", +[](const Python &algo) { return algo.name(); })
       .add_property("is_active", &Algo::is_active);
 
   bp::def("get_security",
           bp::make_function(
-              +[](Security::IdType id) {
-                return SecurityManager::Instance().Get(id);
+              +[](bp::object id_or_name) {
+                try {
+                  return SecurityManager::Instance().Get(
+                      bp::extract<std::string>(id_or_name));
+                } catch (const bp::error_already_set &err) {
+                  PyErr_Clear();
+                }
+                try {
+                  return SecurityManager::Instance().Get(
+                      bp::extract<int64_t>(id_or_name));
+                } catch (const bp::error_already_set &err) {
+                  PyErr_Clear();
+                }
+                const Security *ptr = nullptr;
+                return ptr;
               },
               bp::return_value_policy<bp::reference_existing_object>()));
 
@@ -585,7 +627,7 @@ BOOST_PYTHON_MODULE(opentrade) {
   bp::class_<Backtest, boost::noncopyable>("Backtest", bp::no_init)
       .def("clear",
            +[](Backtest &) {
-             // clear is called allways, not clearing cause a lot of problems
+             // clear is called always, not clearing cause a lot of problems
              LOG2_WARN("backtest clear is deprecated");
            })
       .def("skip", &Backtest::Skip)
@@ -604,6 +646,11 @@ BOOST_PYTHON_MODULE(opentrade) {
                                                 const SubAccount &acc) {
              AlgoManager::Instance().Stop(sec.id, acc.id);
            }))
+      .add_property("user", bp::make_function(
+                                +[](Backtest &) {
+                                  return AccountManager::Instance().GetUser(0);
+                                },
+                                bp::return_internal_reference<>()))
       .def("start_algo",
            bp::make_function(+[](Backtest &, const std::string &name,
                                  bp::dict params) {
@@ -632,6 +679,9 @@ BOOST_PYTHON_MODULE(opentrade) {
              }
              auto algo =
                  AlgoManager::Instance().Spawn(params_ptr, name, *user, "", "");
+             if (!algo) {
+               LOG_ERROR("Unknown algo name: " << name);
+             }
              return algo ? algo->id() : 0;
            }));
 #endif

@@ -31,49 +31,27 @@ std::string Exchange::ParseTickSizeTable(const std::string& str) {
   return {};
 }
 
-std::string Exchange::ParseTradePeriod(const std::string& str) {
+std::string Exchange::ParsePeriod(const std::string& str, int* start,
+                                  int* end) {
   if (str.empty()) {
-    trade_start = 0;
-    trade_end_ = 0;
+    if (start) *start = 0;
+    if (end) *end = 0;
     return {};
   }
   if (atoi(str.c_str()) > 10000) {  // for back-compactible, will remove
-    auto trade_period = atoi(str.c_str());
-    auto start = trade_period / 10000;
-    auto end = trade_period % 10000;
-    trade_start = (start / 100) * 3600 + (start % 100) * 60;
-    trade_end_ = ((end / 100) * 3600 + (end % 100) * 60);
+    auto period = atoi(str.c_str());
+    auto a = period / 10000;
+    auto b = period % 10000;
+    if (start) *start = (a / 100) * 3600 + (a % 100) * 60;
+    if (end) *end = ((b / 100) * 3600 + (b % 100) * 60);
     return {};
   }
   int a, b, c, d;
   if (sscanf(str.c_str(), "%d:%d-%d:%d", &a, &b, &c, &d) != 4) {
     return "Invalid trade period, expect 'HH:MM-HH:MM'";
   }
-  trade_start = a * 3600 + b * 60;
-  trade_end_ = c * 3600 + d * 60;
-  return {};
-}
-
-std::string Exchange::ParseBreakPeriod(const std::string& str) {
-  if (str.empty()) {
-    break_start = 0;
-    break_end = 0;
-    return {};
-  }
-  if (atoi(str.c_str()) > 10000) {  // for back-compactible, will remove
-    auto break_period = atoi(str.c_str());
-    auto start = break_period / 10000;
-    auto end = break_period % 10000;
-    break_start = (start / 100) * 3600 + (start % 100) * 60;
-    break_end = ((end / 100) * 3600 + (end % 100) * 60);
-    return {};
-  }
-  int a, b, c, d;
-  if (sscanf(str.c_str(), "%d:%d-%d:%d", &a, &b, &c, &d) != 4) {
-    return "Invalid break period, expect 'HH:MM-HH:MM'";
-  }
-  break_start = a * 3600 + b * 60;
-  break_end = c * 3600 + d * 60;
+  if (start) *start = a * 3600 + b * 60;
+  if (end) *end = c * 3600 + d * 60;
   return {};
 }
 
@@ -226,13 +204,13 @@ void SecurityManager::LoadFromDatabase() {
     auto ex_it = exchanges_.find(exchange_id);
     if (ex_it != exchanges_.end()) {
       s->exchange = ex_it->second;
-      ex_it->second->security_of_name.emplace(s->symbol, s);
     }
     auto underlying_id = Database::GetValue(*it, i++, Security::IdType());
     if (underlying_id > 0) {
       underlying_map[s] = underlying_id;
     }
     s->rate = Database::GetValue(*it, i++, s->rate);
+    if (s->rate > 0 && *s->currency) rates_[s->currency] = s->rate;
     if (s->rate <= 0) s->rate = 1;
     s->multiplier = Database::GetValue(*it, i++, s->multiplier);
     if (s->multiplier <= 0) s->multiplier = 1;
@@ -258,6 +236,12 @@ void SecurityManager::LoadFromDatabase() {
     s->SetParams(Database::GetValue(*it, i++, kEmptyStr));
     std::atomic_thread_fence(std::memory_order_release);
     securities_.emplace(s->id, s);
+    if (s->exchange) {
+      const_cast<Exchange*>(s->exchange)
+          ->security_of_name.emplace(s->symbol, s);
+      security_of_name_.emplace(
+          s->symbol + std::string(" ") + s->exchange->name, s);
+    }
   }
   LOG_INFO(securities_.size() << " securities loaded");
   for (auto& pair : underlying_map) {
@@ -273,7 +257,7 @@ void SecurityManager::UpdateCheckSum() {
   for (auto& pair : securities_) {
     auto s = pair.second;
     ss << pair.first << s->symbol << s->exchange->name << s->type << s->lot_size
-       << s->multiplier;
+       << s->multiplier << s->currency;
   }
   check_sum_ = strdup(sha1(ss.str()).c_str());
 }
@@ -290,6 +274,77 @@ double Exchange::GetTickSize(double ref) const {
   auto it = std::lower_bound(table->begin(), table->end(), t);
   if (it == table->end()) return 0;
   return it->value;
+}
+
+std::vector<const Security*> SecurityManager::GetSecurities(
+    std::basic_istream<char>* ifs, const char* fn, bool* binary,
+    const std::set<std::string>& used_symbols) {
+  std::string line;
+  if (!std::getline(*ifs, line)) {
+    LOG_FATAL("Invalid file: " << fn);
+  }
+  char a[256];
+  *a = 0;
+  char b[256];
+  *b = 0;
+  char c[256];
+  *c = 0;
+  std::vector<const Security*> out;
+  if (sscanf(line.c_str(), "%s %s %s", a, b, c) < 2 ||
+      strcasecmp(a, "@begin")) {
+    LOG_FATAL("Invalid file: " << fn);
+  }
+  *binary = !strncasecmp(c, "bin", 3);
+  std::unordered_map<std::string, const Security*> sec_map;
+  if (!strcasecmp(b, "bbgid")) {
+    for (auto& pair : securities()) {
+      if (*pair.second->bbgid) sec_map[pair.second->bbgid] = pair.second;
+    }
+  } else if (!strcasecmp(b, "isin")) {
+    for (auto& pair : securities()) {
+      if (*pair.second->isin) sec_map[pair.second->isin] = pair.second;
+    }
+  } else if (!strcasecmp(b, "cusip")) {
+    for (auto& pair : securities()) {
+      if (*pair.second->cusip) sec_map[pair.second->cusip] = pair.second;
+    }
+  } else if (!strcasecmp(b, "sedol")) {
+    for (auto& pair : securities()) {
+      if (*pair.second->sedol) sec_map[pair.second->sedol] = pair.second;
+    }
+  } else if (!strcasecmp(b, "id")) {
+    for (auto& pair : securities()) {
+      sec_map[std::to_string(pair.second->id)] = pair.second;
+    }
+  } else if (!strcasecmp(b, "symbol")) {
+    for (auto& pair : securities()) {
+      sec_map[pair.second->symbol + std::string(" ") +
+              pair.second->exchange->name] = pair.second;
+    }
+  } else if (!strcasecmp(b, "local_symbol")) {
+    for (auto& pair : securities()) {
+      if (*pair.second->local_symbol)
+        sec_map[pair.second->local_symbol + std::string(" ") +
+                pair.second->exchange->name] = pair.second;
+    }
+  } else {
+    LOG_FATAL("Invalid file: " << fn);
+  }
+
+  while (std::getline(*ifs, line)) {
+    if (!strcasecmp(line.c_str(), "@end")) break;
+    auto sec = sec_map[line];
+    if (!sec) {
+      LOG_ERROR("Unknown security on line " << line << " of " << fn);
+      continue;
+    }
+    if (used_symbols.size() && used_symbols.find(line) == used_symbols.end())
+      sec = nullptr;
+    out.push_back(sec);
+  }
+  LOG_INFO(out.size() << " securities in " << fn);
+
+  return out;
 }
 
 }  // namespace opentrade

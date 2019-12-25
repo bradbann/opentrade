@@ -68,8 +68,8 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
     libquickfix-dev \
     libtbb-dev \
     liblog4cxx-dev
-
   ```
+
   * Build
   ```bash
   git clone https://github.com/opentradesolutions/opentrade
@@ -77,7 +77,7 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
   make debug
   ```
   
- * **Setup database**
+* **Setup database**
    * Sqlite3
    ```bash
    wget https://github.com/opentradesolutions/data/raw/master/test.sqlite3
@@ -97,15 +97,11 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
    exit # become yourself again
    ```
  
- * **Run opentrade**
+* **Run opentrade**
    * Download tick data files
    ```bash
    cd opentrade
-   wget https://raw.githubusercontent.com/opentradesolutions/data/master/bbgids.txt
-   wget https://github.com/opentradesolutions/data/raw/master/ticks.txt.xz.part1
-   wget https://github.com/opentradesolutions/data/raw/master/ticks.txt.xz.part2
-   cat ticks.txt.xz.part1 ticks.txt.xz.part2 > ticks.txt.xz
-   xz -d ticks.txt.xz
+   wget -O ticks.txt.xz https://www.dropbox.com/s/b2xf0esn0rctygs/ticks.txt.xz?dl=1
    ```
    * Run
    ```Bash
@@ -114,19 +110,28 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
    ./opentrade
    ```
    
- * **Open Web UI**
+* **Open Web UI**
    ```
    # username/password: test/test
    http://localhost:9111
    ```
+   
+# CentOS 8
+
+ Please checkout [install_centos.sh](https://github.com/opentradesolutions/opentrade/blob/master/install_centos.sh)
+
+# Internal Latency
+  ```
+  make test-latency
+  ```
    
 # Backtest
   * Only BBO support currently, full orderbook support will come soon
   * It is up to you to generate report
   ```
   make args=-j backtest-debug
-  wget -O ticks.tgz https://www.dropbox.com/s/maikrn2qbz8hxba/ticks.tgz?dl=1; tar xzf ticks.tgz
-  ./build/backtest-debug/opentrade/opentrade -b scripts/backtest.py -t ticks/%Y%m%d -s 20170701 -e 20181115
+  wget -O ticks.tar https://www.dropbox.com/s/fmuwm7j9suc2z3e/ticks.tar?dl=1; tar xf ticks.tar
+  ./build/backtest-debug/opentrade/opentrade -b scripts/backtest.py -t ticks/%Y%m%d.xz -s 20170701 -e 20181115
   ```
   
 # Execution Optimization Example
@@ -134,6 +139,7 @@ OpenTrade is an open source OEMS, and algorithmic trading platform, designed for
   make args=-j backtest-release
   cd scripts/execution_optimization
   wget https://raw.githubusercontent.com/opentradesolutions/data/master/targets.zip; unzip targets.zip;
+  wget https://github.com/opentradesolutions/data/raw/master/test.sqlite3
   ./run
   ./sim_summary.py rpt*
   ```

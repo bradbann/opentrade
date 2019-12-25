@@ -166,15 +166,7 @@ void PositionManager::Initialize() {
     bod.realized_pnl = p.realized_pnl;
     bod.commission = p.commission;
     bod.broker_account_id = broker_account_id;
-    if (Database::is_sqlite()) {
-      tm = Database::GetValue(*it, i++, tm);
-      static const pt::ptime kEpoch(boost::gregorian::date(1970, 1, 1));
-      bod.tm = (pt::time_from_string(tm) - kEpoch).total_seconds();
-    } else {
-      std::tm std_tm;
-      std_tm = Database::GetValue(*it, i++, std_tm);
-      bod.tm = mktime(&std_tm);
-    }
+    bod.tm = Database::GetTm(*it, i++);
     self.bods_.emplace(std::make_pair(sub_account_id, security_id), bod);
     self.sub_positions_.emplace(std::make_pair(sub_account_id, security_id), p);
     auto& p2 =
@@ -293,8 +285,8 @@ void PositionManager::Handle(Confirmation::Ptr cm, bool offline) {
           sub_account_id = ord->sub_account->id;
           security_id = ord->sec->id;
           broker_account_id = ord->broker_account->id;
-          qty = pos.qty;
-          cx_qty = pos.cx_qty;
+          qty = Round6(pos.qty);
+          cx_qty = Round6(pos.cx_qty);
           avg_px = pos.avg_px;
           realized_pnl0 = pos.realized_pnl0;
           commission0 = pos.commission0;
@@ -384,24 +376,34 @@ void PositionManager::Handle(Confirmation::Ptr cm, bool offline) {
 
 template <typename T1, typename T2>
 void UpdateBalance(T1* positions, T2* accs) {
-  std::map<int64_t, std::pair<double, double>> balances;
+  std::unordered_map<int64_t, std::pair<double, double>> balances;
   auto& sm = SecurityManager::Instance();
+  std::unordered_map<Security::IdType,
+                     std::vector<std::pair<uint64_t, Position*>>>
+      group;
   for (auto& pair : *positions) {
-    auto acc = pair.first.first;
-    auto sec_id = pair.first.second;
-    auto& pos = pair.second;
-    if (!pos.qty && !pos.unrealized_pnl) continue;
+    group[pair.first.second].push_back(
+        std::make_pair(pair.first.first, &pair.second));
+  }
+  for (auto& pair : group) {
+    auto sec_id = pair.first;
     auto sec = sm.Get(sec_id);
     if (!sec) continue;
     auto price = sec->CurrentPrice();
     if (!price) continue;
-    auto m = sec->rate * sec->multiplier;
-    pos.unrealized_pnl = pos.qty * (price - pos.avg_px) * m;
-    auto qty = pos.qty + pos.total_outstanding_buy - pos.total_outstanding_sell;
-    if (qty > 0)
-      balances[acc].first += qty * price * m;
-    else
-      balances[acc].second -= qty * price * m;
+    for (auto& acc_pos : pair.second) {
+      auto acc = acc_pos.first;
+      auto& pos = *acc_pos.second;
+      if (!pos.qty && !pos.unrealized_pnl) continue;
+      auto m = sec->rate * sec->multiplier;
+      pos.unrealized_pnl = pos.qty * (price - pos.avg_px) * m;
+      auto qty =
+          pos.qty + pos.total_outstanding_buy - pos.total_outstanding_sell;
+      if (qty > 0)
+        balances[acc].first += qty * price * m;
+      else
+        balances[acc].second -= qty * price * m;
+    }
   }
   for (auto& pair : *accs) {
     auto x = balances[pair.first];
@@ -416,7 +418,7 @@ void PositionManager::UpdatePnl() {
   UpdateBalance(&broker_positions_, &am.broker_accounts_);
   UpdateBalance(&user_positions_, &am.users_);
 
-  std::map<SubAccount::IdType, Pnl> pnls;
+  std::unordered_map<SubAccount::IdType, Pnl> pnls;
   for (auto& pair : sub_positions_) {
     auto acc = pair.first.first;
     auto& pos = pair.second;
@@ -434,17 +436,22 @@ void PositionManager::UpdatePnl() {
   auto tm = GetTime();
   for (auto& pair : pnls) {
     auto& pnl0 = pnls_[pair.first];
+    auto& of = pnl0.of;
     auto& pnl = pair.second;
-    if (std::abs(pnl.unrealized - pnl0.unrealized) < 1) continue;
-    if (n % 15 == 0) {
-      if (!pnl0.of) {
-        auto path = kStorePath / ("pnl-" + std::to_string(pair.first));
-        pnl0.of = new std::ofstream(path.c_str(), std::ofstream::app);
-      }
-      *pnl0.of << tm << ' ' << pnl.unrealized << ' ' << pnl.commission << ' '
-               << pnl.realized << std::endl;
-    }
     static_cast<Pnl&>(pnl0) = pnl;
+    if (n % 15 == 0) {
+      static tbb::concurrent_unordered_map<SubAccount::IdType, Pnl> kPnls0;
+      auto& pnl0 = kPnls0[pair.first];
+      if (pnl0.unrealized != pnl.unrealized || pnl0.realized != pnl.realized) {
+        if (!of) {
+          auto path = kStorePath / ("pnl-" + std::to_string(pair.first));
+          of = new std::ofstream(path.c_str(), std::ofstream::app);
+        }
+        *of << tm << ' ' << pnl.unrealized << ' ' << pnl.commission << ' '
+            << pnl.realized << std::endl;
+        pnl0 = pnl;
+      }
+    }
   }
   ++n;
 

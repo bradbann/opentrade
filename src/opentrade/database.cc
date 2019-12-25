@@ -7,7 +7,21 @@
 #include "logger.h"
 #include "security.h"
 
+namespace pt = boost::posix_time;
+
 namespace opentrade {
+
+time_t Database::GetTm(soci::row const& row, int index) {
+  if (is_sqlite()) {
+    auto tm = GetValue(row, index, kEmptyStr);
+    static const pt::ptime kEpoch(boost::gregorian::date(1970, 1, 1));
+    return (pt::time_from_string(tm) - kEpoch).total_seconds();
+  } else {
+    std::tm std_tm;
+    std_tm = GetValue(row, index, std_tm);
+    return MakeTime(&std_tm, "UTC");
+  }
+}
 
 class SqlLog : public std::ostream, std::streambuf {
  public:
@@ -41,7 +55,7 @@ static const char create_tables_sql[] = R"(
     "ib_name" varchar(50),
     "bb_name" varchar(50),
     "tz" varchar(20),
-    params varchar(1000),
+    params json,
     odd_lot_allowed boolean,
     trade_period varchar(32), -- e.g. 09:30-15:00
     break_period varchar(32), -- e.g. 11:30-13:00
@@ -153,7 +167,7 @@ static const char create_tables_sql[] = R"(
     user_id int2 references "user"(id), -- on update cascade on delete cascade,
     sub_account_id int2 references sub_account(id), -- on update cascade on delete cascade,
     broker_account_id int2 references broker_account(id), -- on update cascade on delete cascade,
-    security_id int2 references security(id), -- on update cascade on delete cascade,
+    security_id int4 references security(id), -- on update cascade on delete cascade,
     tm timestamp not null,
     qty float8 not null,
     cx_qty float8,
@@ -163,6 +177,12 @@ static const char create_tables_sql[] = R"(
     info json
   );
   create index if not exists position__index_acc_sec_tm on position(sub_account_id, security_id, tm desc);
+
+  create table if not exists stop_book(
+    security_id int4 not null references security(id), -- on update cascade on delete cascade,
+    sub_account_id int2 not null references sub_account(id), -- on update cascade on delete cascade,
+    primary key(security_id, sub_account_id)
+  );
 )";
 
 void Database::Initialize(const std::string& url, uint8_t pool_size,
@@ -180,16 +200,18 @@ void Database::Initialize(const std::string& url, uint8_t pool_size,
   }
   for (auto i = 0u; i < pool_size; ++i) {
     auto& sql = pool_->at(i);
-    if (is_sqlite_)
-      sql.open(soci::sqlite3, url);
-    else
+    if (is_sqlite_) {
+      sql.open(soci::sqlite3, "db=" + url + " shared_cache=true");
+      sql << "PRAGMA journal_mode=WAL;";
+    } else {
       sql.open(soci::postgresql, url);
+    }
     sql.set_log_stream(&log);
   }
   LOG_INFO("Database connected");
   if (!create_tables) {
     try {
-      *Session() << "select * from exchange limit 1";
+      *Session() << "select * from stop_book limit 1";
     } catch (const soci::soci_error& e) {
       create_tables = true;
     }

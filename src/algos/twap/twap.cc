@@ -15,6 +15,9 @@ std::string TWAP::OnStart(const ParamMap& params) noexcept {
   assert(st_.acc);
   assert(st_.side);
   assert(st_.qty > 0);
+  not_lower_than_last_px_ = st_.position_effect == kOpenPosition &&
+                            !IsBuy(st_.side) && kCN == sec->exchange->country &&
+                            kStock == sec->type;
 
   inst_ = Subscribe();
   initial_volume_ = inst_->md().trade.volume;
@@ -22,6 +25,8 @@ std::string TWAP::OnStart(const ParamMap& params) noexcept {
   if (seconds < 60) return "Too short ValidSeconds, must be >= 60";
   begin_time_ = GetTime();
   price_ = GetParam(params, "Price", 0.);
+  if (price_ > 0) price_ = RoundPrice(price_);
+
   end_time_ = begin_time_ + seconds;
   min_size_ = GetParam(params, "MinSize", 0);
   if (min_size_ <= 0 && sec->lot_size <= 0) {
@@ -114,55 +119,12 @@ void TWAP::Timer() {
   auto& md = this->md();
   auto bid = md.quote().bid_price;
   auto ask = md.quote().ask_price;
-  auto last_px = md.trade.close;
+  // md.trade.close may be not rounded
+  auto last_px = RoundPrice(md.trade.close);
   auto mid_px = 0.;
-  if (ask > bid && bid > 0) {
-    mid_px = (ask + bid) / 2;
-    auto tick_size = inst_->sec().GetTickSize(mid_px);
-    if (tick_size > 0) {
-      if (IsBuy(st_.side))
-        mid_px = std::ceil(mid_px / tick_size) * tick_size;
-      else
-        mid_px = std::floor(mid_px / tick_size) * tick_size;
-    }
-  }
+  if (ask > bid && bid > 0) mid_px = RoundPrice((ask + bid) / 2);
 
-  if (!inst_->active_orders().empty()) {
-    for (auto ord : inst_->active_orders()) {
-      if (IsBuy(st_.side)) {
-        if (ord->price < bid) {
-          Cancel(*ord);
-        }
-      } else {
-        if (ask > 0 && ord->price > ask) {
-          Cancel(*ord);
-        }
-      }
-    }
-    return;
-  }
-
-  auto volume = md.trade.volume - initial_volume_;
-  if (volume > 0 && max_pov_ > 0) {
-    if (inst_->total_qty() - inst_->total_cx_qty() > max_pov_ * volume) return;
-  }
-  auto leaves = GetLeaves();
-  if (leaves <= 0) return;
-  auto total_leaves = st_.qty - inst_->total_exposure();
-  auto lot_size = inst_->sec().lot_size;
-  auto odd_ok = inst_->sec().exchange->odd_lot_allowed || (lot_size <= 0);
-  if (lot_size <= 0) lot_size = std::max(1, min_size_);
-  auto max_qty =
-      odd_ok ? total_leaves : std::floor(total_leaves / lot_size) * lot_size;
-  if (max_qty <= 0) return;
-  auto would_qty = std::ceil(leaves / lot_size) * lot_size;
-  if (would_qty < min_size_) would_qty = min_size_;
-  if (would_qty > max_qty) would_qty = max_qty;
-  if (max_floor_ > 0 && would_qty > max_floor_) would_qty = max_floor_;
   Contract c;
-  c.side = st_.side;
-  c.qty = would_qty;
-  c.sub_account = st_.acc;
   switch (agg_) {
     case kAggLow:
       if (IsBuy(st_.side)) {
@@ -203,9 +165,46 @@ void TWAP::Timer() {
       c.type = kMarket;
       break;
   }
-  if (price_ > 0 && ((IsBuy(st_.side) && c.price > price_) ||
-                     (!IsBuy(st_.side) && c.price < price_)))
+  if (c.type != kMarket && price_ > 0 &&
+      ((IsBuy(st_.side) && c.price > price_) ||
+       (!IsBuy(st_.side) && c.price < price_))) {
+    c.price = price_;
+  }
+  if (not_lower_than_last_px_ && c.price < last_px) c.price = last_px;
+
+  if (!inst_->active_orders().empty()) {
+    for (auto ord : inst_->active_orders()) {
+      if (c.price <= 0 || c.price == ord->price) continue;
+      if (IsBuy(st_.side)) {
+        if (ord->price < bid) Cancel(*ord);
+      } else {
+        if (ask > 0 && ord->price > ask) Cancel(*ord);
+      }
+    }
     return;
+  }
+
+  auto volume = md.trade.volume - initial_volume_;
+  if (volume > 0 && max_pov_ > 0) {
+    if (inst_->total_qty() - inst_->total_cx_qty() > max_pov_ * volume) return;
+  }
+  auto leaves = GetLeaves();
+  if (leaves <= 0) return;
+  auto total_leaves = st_.qty - inst_->total_exposure();
+  auto lot_size = inst_->sec().lot_size;
+  auto odd_ok = inst_->sec().exchange->odd_lot_allowed || (lot_size <= 0);
+  if (lot_size <= 0) lot_size = std::max(1, min_size_);
+  auto max_qty =
+      odd_ok ? total_leaves : std::floor(total_leaves / lot_size) * lot_size;
+  if (max_qty <= 0) return;
+  auto would_qty = std::ceil(leaves / lot_size) * lot_size;
+  if (would_qty < min_size_) would_qty = min_size_;
+  if (max_floor_ > 0 && would_qty > max_floor_) would_qty = max_floor_;
+  if (would_qty > max_qty) would_qty = max_qty;
+  c.side = st_.side;
+  c.qty = would_qty;
+  c.sub_account = st_.acc;
+  c.position_effect = st_.position_effect;
   Place(&c);
 }
 

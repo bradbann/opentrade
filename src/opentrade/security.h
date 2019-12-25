@@ -75,8 +75,14 @@ struct Exchange : public ParamsBase {
 
   std::string ParseTickSizeTable(const std::string& str);
   std::string ParseHalfDays(const std::string& str);
-  std::string ParseTradePeriod(const std::string& str);
-  std::string ParseBreakPeriod(const std::string& str);
+  std::string ParsePeriod(const std::string& str, int* start = nullptr,
+                          int* end = nullptr);
+  std::string ParseTradePeriod(const std::string& str) {
+    return ParsePeriod(str, &trade_start, &trade_end_);
+  }
+  std::string ParseBreakPeriod(const std::string& str) {
+    return ParsePeriod(str, &break_start, &break_end);
+  }
   std::string ParseHalfDay(const std::string& str);
   std::string GetTickSizeTableString() const;
   std::string GetHalfDaysString() const;
@@ -102,6 +108,8 @@ inline const std::string kFutureOption = "FOP";
 inline const std::string kCombo = "BAG";
 inline const std::string kWarrant = "WAR";
 inline const std::string kBond = "BOND";
+
+inline const std::string kCN = "CN";
 
 struct Security : public ParamsBase {
   typedef uint32_t IdType;
@@ -171,13 +179,24 @@ class SecurityManager : public Singleton<SecurityManager> {
     return exch ? exch->Get(sec_name) : nullptr;
   }
 
+  const Security* Get(const std::string& name) const {
+    return FindInMap(security_of_name_, name);
+  }
+
+  std::vector<const Security*> GetSecurities(
+      std::basic_istream<char>* ifs, const char* fn, bool* binary,
+      const std::set<std::string>& used_symbols = {});
+
   typedef tbb::concurrent_unordered_map<Security::IdType, Security*>
       SecurityMap;
+  typedef tbb::concurrent_unordered_map<std::string, Security*>
+      SecurityOfNameMap;
   const SecurityMap& securities() const { return securities_; }
   void LoadFromDatabase();
   typedef tbb::concurrent_unordered_map<Exchange::IdType, Exchange*>
       ExchangeMap;
   const ExchangeMap& exchanges() const { return exchanges_; }
+  auto& rates() const { return rates_; }
 
  protected:
   void UpdateCheckSum();
@@ -186,8 +205,10 @@ class SecurityManager : public Singleton<SecurityManager> {
   ExchangeMap exchanges_;
   tbb::concurrent_unordered_map<std::string, Exchange*> exchange_of_name_;
   SecurityMap securities_;
+  SecurityOfNameMap security_of_name_;
   const char* check_sum_ = "";
   friend class Connection;
+  std::unordered_map<std::string, double> rates_;
 };
 
 }  // namespace opentrade

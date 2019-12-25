@@ -21,6 +21,7 @@ static inline void Async(std::function<void()> func, double seconds = 0) {
 
 inline double Simulator::TryFillBuy(double px, double qty,
                                     Orders* actives_of_sec) {
+  if (!px) return qty;
   for (auto it = actives_of_sec->buys.rbegin();
        it != actives_of_sec->buys.rend() && qty > 0 && px <= it->first;) {
     auto& tuple = it->second;
@@ -48,6 +49,7 @@ inline double Simulator::TryFillBuy(double px, double qty,
 
 inline double Simulator::TryFillSell(double px, double qty,
                                      Orders* actives_of_sec) {
+  if (!px) return qty;
   for (auto it = actives_of_sec->sells.begin();
        it != actives_of_sec->sells.end() && qty > 0 && px >= it->first;) {
     auto& tuple = it->second;
@@ -76,9 +78,14 @@ void Simulator::HandleTick(const Security& sec, char type, double px,
                            double qty, double trade_hit_ratio,
                            Orders* actives_of_sec) {
   if (!qty && sec.type == kForexPair && type != 'T') qty = 1e9;
+  static bool kHasFxTrade;
   switch (type) {
     case 'T': {
       Update(sec.id, px, qty);
+      if (sec.type == kForexPair) {
+        if (!kHasFxTrade) kHasFxTrade = true;
+        break;  // not try fill for FX trade tick
+      }
       if (actives_of_sec->all.empty()) return;
       if (px > 0 && qty > 0 &&
           rand_r(&seed_) % 100 / 100. >= (1 - trade_hit_ratio)) {
@@ -89,10 +96,12 @@ void Simulator::HandleTick(const Security& sec, char type, double px,
     case 'A':
       Update(sec.id, px, qty, false);
       TryFillBuy(px, qty, actives_of_sec);
+      if (sec.type == kForexPair && !kHasFxTrade) UpdateMidAsLastPrice(sec.id);
       break;
     case 'B':
       Update(sec.id, px, qty, true);
       TryFillSell(px, qty, actives_of_sec);
+      if (sec.type == kForexPair && !kHasFxTrade) UpdateMidAsLastPrice(sec.id);
       break;
     default:
       break;
@@ -149,7 +158,7 @@ std::string Simulator::Place(const Order& ord) noexcept {
         assert(actives_of_sec.all.size() ==
                actives_of_sec.buys.size() + actives_of_sec.sells.size());
         Async([this, &ord, &actives_of_sec]() {
-          auto& md = (*md_)[ord.sec->id];
+          auto& md = this->md()[ord.sec->id];
           auto px = ord.IsBuy() ? md.quote().ask_price : md.quote().bid_price;
           if (!px) return;
           auto qty = ord.IsBuy() ? md.quote().ask_size : md.quote().bid_size;
@@ -187,7 +196,7 @@ std::string Simulator::Cancel(const Order& ord) noexcept {
 
 void Simulator::ResetData() {
   seed_ = 0;
-  for (auto& pair : *md_) {
+  for (auto& pair : md()) {
     const_cast<Security*>(SecurityManager::Instance().Get(pair.first))
         ->close_price = pair.second.trade.close;
     pair.second.Clear();

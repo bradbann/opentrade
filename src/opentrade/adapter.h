@@ -2,6 +2,7 @@
 #define OPENTRADE_ADAPTER_H_
 
 #include <tbb/atomic.h>
+#include <boost/lexical_cast.hpp>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -14,7 +15,7 @@ static const char* kApiVersion =
 #ifdef BACKTEST
     "backtest_"
 #endif
-    "1.3.1";
+    "1.4.1";
 
 class Adapter {
  public:
@@ -34,11 +35,27 @@ class Adapter {
     return inst;
   }
   const StrMap& config() const { return config_; }
-  std::string config(const std::string& name) const {
-    return FindInMap(config_, name);
+  template <typename T = std::string>
+  T config(const std::string& name, T default_value = {}) const {
+    auto str = FindInMap(config_, name);
+    if (str.empty()) return default_value;
+    if constexpr (std::is_same_v<std::decay_t<T>, std::string>) {
+      return str;
+    } else {
+      try {
+        return boost::lexical_cast<T>(str);
+      } catch (const std::bad_cast&) {
+        return default_value;
+      }
+    }
   }
   static Adapter* Load(const std::string& sofile);
   virtual void Start() noexcept = 0;
+  const auto& create_func() { return create_func_; }
+  void set_create_func(Func f) {
+    assert(!create_func_);
+    create_func_ = f;
+  }
 
  protected:
   std::string name_;
@@ -64,7 +81,14 @@ template <typename T, AdapterPrefix prefix = kEmptyPrefix>
 class AdapterManager {
  public:
   typedef std::unordered_map<std::string, T*> AdapterMap;
-  void AddAdapter(T* adapter) { adapters_[adapter->name()] = adapter; }
+  virtual void AddAdapter(T* adapter) { adapters_[adapter->name()] = adapter; }
+  template <typename B>
+  void AddAdapterTmpl() {
+    static_assert(std::is_base_of<T, B>::value);
+    auto adapter = new B;
+    adapter->set_create_func([]() { return new B; });
+    AddAdapter(adapter);
+  }
   T* GetAdapter(const std::string& name) {
     auto out = FindInMap(adapters_, name);
     if (out) return out;

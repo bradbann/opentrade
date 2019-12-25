@@ -5,8 +5,7 @@
 #include <tbb/concurrent_unordered_set.h>
 #include <atomic>
 #include <boost/python.hpp>
-#include <map>
-#include <set>
+#include <boost/unordered_map.hpp>
 #include <shared_mutex>
 #include <string>
 
@@ -16,7 +15,7 @@
 namespace opentrade {
 
 struct DataSrc {
-  typedef uint32_t IdType;
+  typedef uint64_t IdType;
 
   IdType value = 0;
   DataSrc() : value(0) {}
@@ -41,9 +40,9 @@ struct DataSrc {
   }
 
   static const char* GetStr(IdType id) {
-    static thread_local char str[5];
+    static thread_local char str[9];
     auto i = 0u;
-    for (i = 0u; i < 4 && id; ++i) {
+    for (i = 0u; i < sizeof(IdType) && id; ++i) {
       str[i] = id & 0xFF;
       id >>= 8;
     }
@@ -54,6 +53,7 @@ struct DataSrc {
 
 struct MarketData;
 struct TradeTickHook {
+  virtual ~TradeTickHook() {}
   // OnTrade is not ensured to be called in the same thread of its algo
   virtual void OnTrade(DataSrc::IdType src, Security::IdType id,
                        const MarketData* md, time_t tm, double px,
@@ -89,7 +89,6 @@ struct MarketData {
 #endif
   time_t tm = 0;
   struct Trade {
-    time_t tm = 0;
     Qty qty = 0;
     double open = 0;
     double high = 0;
@@ -142,6 +141,7 @@ struct MarketData {
   typedef Quote Depth[kDepthSize];
 
   const Quote& quote() const { return depth[0]; }
+  auto mid() const { return (quote().ask_price + quote().bid_price) / 2; }
 
   Trade trade;
   Depth depth;
@@ -227,21 +227,31 @@ class MarketDataAdapter : public virtual NetworkAdapter {
     });
   }
   DataSrc::IdType src() const { return src_; }
+  MarketDataMap& md() { return *md_; }
   void Update(Security::IdType id, const MarketData::Quote& q,
-              uint32_t level = 0, time_t tm = 0);
+              uint32_t level = 0, time_t tm = 0, MarketData* md_ptr = nullptr);
   void Update(Security::IdType id, double price, MarketData::Qty size,
-              bool is_bid, uint32_t level = 0, time_t tm = 0);
+              bool is_bid, uint32_t level = 0, time_t tm = 0,
+              MarketData* md_ptr = nullptr);
   void Update(Security::IdType id, double last_price, MarketData::Qty last_qty,
-              time_t tm = 0);
+              time_t tm = 0, MarketData* md_ptr = nullptr);
   void Update(Security::IdType id, double last_price, MarketData::Volume volume,
-              double open, double high, double low, double vwap, time_t tm = 0);
-  void UpdateMidAsLastPrice(Security::IdType id, time_t tm = 0);
-  void UpdateAskPrice(Security::IdType id, double v, time_t tm = 0);
-  void UpdateAskSize(Security::IdType id, double v, time_t tm = 0);
-  void UpdateBidPrice(Security::IdType id, double v, time_t tm = 0);
-  void UpdateBidSize(Security::IdType id, double v, time_t tm = 0);
-  void UpdateLastPrice(Security::IdType id, double v, time_t tm = 0);
-  void UpdateLastSize(Security::IdType id, double v, time_t tm = 0);
+              double open, double high, double low, double vwap, time_t tm = 0,
+              MarketData* md_ptr = nullptr);
+  void UpdateMidAsLastPrice(Security::IdType id, time_t tm = 0,
+                            MarketData* md_ptr = nullptr);
+  void UpdateAskPrice(Security::IdType id, double v, time_t tm = 0,
+                      MarketData* md_ptr = nullptr);
+  void UpdateAskSize(Security::IdType id, double v, time_t tm = 0,
+                     MarketData* md_ptr = nullptr);
+  void UpdateBidPrice(Security::IdType id, double v, time_t tm = 0,
+                      MarketData* md_ptr = nullptr);
+  void UpdateBidSize(Security::IdType id, double v, time_t tm = 0,
+                     MarketData* md_ptr = nullptr);
+  void UpdateLastPrice(Security::IdType id, double v, time_t tm = 0,
+                       MarketData* md_ptr = nullptr);
+  void UpdateLastSize(Security::IdType id, double v, time_t tm = 0,
+                      MarketData* md_ptr = nullptr);
 
  protected:
   void ReSubscribeAll() {
@@ -250,12 +260,12 @@ class MarketDataAdapter : public virtual NetworkAdapter {
   virtual void SubscribeSync(const Security& sec) noexcept = 0;
 
  protected:
-  MarketDataMap* md_ = nullptr;
   std::atomic<int> request_counter_ = 0;
   tbb::concurrent_unordered_set<const opentrade::Security*> subs_;
   TaskPool tp_;
 
  private:
+  MarketDataMap* md_ = nullptr;
   DataSrc::IdType src_ = 0;
   friend class MarketDataManager;
 };
@@ -264,7 +274,7 @@ class MarketDataManager : public AdapterManager<MarketDataAdapter, kMdPrefix>,
                           public Singleton<MarketDataManager> {
  public:
   MarketDataAdapter* Subscribe(const Security& sec, DataSrc::IdType src);
-  void AddAdapter(MarketDataAdapter* adapter);
+  void AddAdapter(MarketDataAdapter* adapter) override;
   const MarketData& Get(const Security& sec, DataSrc::IdType src = 0);
   // Lite version without subscription
   const MarketData& GetLite(Security::IdType id, DataSrc::IdType src = 0);
@@ -280,12 +290,13 @@ class MarketDataManager : public AdapterManager<MarketDataAdapter, kMdPrefix>,
   MarketDataAdapter* GetRoute(const Security& sec, DataSrc::IdType src);
 
  private:
-  std::map<DataSrc::IdType, MarketDataAdapter::MarketDataMap> md_of_src_;
+  std::unordered_map<DataSrc::IdType, MarketDataAdapter::MarketDataMap>
+      md_of_src_;
   MarketDataAdapter* default_;
-  std::map<std::pair<DataSrc::IdType, Exchange::IdType>,
-           std::vector<MarketDataAdapter*>>
+  boost::unordered_map<std::pair<DataSrc::IdType, Exchange::IdType>,
+                       std::vector<MarketDataAdapter*>>
       routes_;
-  std::map<DataSrc::IdType, uint8_t> srcs_;
+  std::unordered_map<DataSrc::IdType, uint8_t> srcs_;
 };
 
 }  // namespace opentrade

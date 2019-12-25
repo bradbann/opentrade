@@ -29,6 +29,21 @@ class TWAP : public Algo {
   virtual const MarketData& md() { return inst_->md(); }
   virtual void Place(Contract* c) { Algo::Place(*c, inst_); }
   virtual double GetLeaves() noexcept;
+  double RoundPrice(double px) {
+    auto tick_size = inst_->sec().GetTickSize(px);
+    if (tick_size > 0) {
+      if (IsBuy(st_.side))
+        px = std::floor(px / tick_size) * tick_size;
+      else
+        px = std::ceil(px / tick_size) * tick_size;
+    }
+    if (px > 100) {
+      px = Round6(px);
+    } else {
+      px = Round8(px);
+    }
+    return px;
+  }
 
  protected:
   Instrument* inst_ = nullptr;
@@ -41,6 +56,7 @@ class TWAP : public Algo {
   double max_pov_ = 0;
   double initial_volume_ = 0;
   Aggression agg_ = kAggLow;
+  bool not_lower_than_last_px_ = false;
 };
 
 }  // namespace opentrade
