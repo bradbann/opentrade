@@ -28,6 +28,16 @@ struct LockGIL {
   static inline std::string test_token_saved;
 };
 
+static inline double GetDouble(const bp::object &obj) {
+  auto ptr = obj.ptr();
+  if (PyFloat_Check(ptr)) return PyFloat_AsDouble(ptr);
+  if (PyLong_Check(ptr)) return PyLong_AsLong(ptr);
+#if PY_MAJOR_VERSION < 3
+  if (PyInt_Check(ptr)) return PyInt_AsLong(ptr);
+#endif
+  return 0;
+}
+
 template <typename T>
 static inline bool GetValueScalar(const bp::object &value, T *out) {
   auto ptr = value.ptr();
@@ -62,6 +72,21 @@ static inline bool GetValueScalar(const bp::object &value, T *out) {
 }
 
 #ifdef BACKTEST
+static auto ParseParams(bp::dict params) {
+  auto params_ptr = std::make_shared<Algo::ParamMap>();
+  auto items = params.items();
+  for (auto i = 0u; i < bp::len(items); ++i) {
+    std::string key = bp::extract<std::string>(items[i][0]);
+    ParamDef::Value value;
+    if (!GetValueScalar(items[i][1], &value)) {
+      LOG_ERROR("Invalid '" << key << "' value: "
+                            << bp::extract<const char *>(bp::str(items[i][1])));
+    } else {
+      (*params_ptr)[key] = value;
+    }
+  }
+  return params_ptr;
+}
 #define LOCK() \
   do {         \
   } while (false)
@@ -245,6 +270,19 @@ BOOST_PYTHON_MODULE(opentrade) {
                 << ", commission=" << p.commission
                 << ", realized_pnl=" << p.realized_pnl << ")";
              return ss.str();
+           })
+      .def("adjust",
+           +[](Position &p, bp::object px, bp::object vol) {
+             auto px_adj = GetDouble(px);
+             auto vol_adj = GetDouble(vol);
+             if (px_adj <= 0 || vol_adj <= 0) return;
+             p.avg_px *= px_adj;
+             p.qty *= vol_adj;
+             p.cx_qty *= vol_adj;
+             p.total_bought_qty *= vol_adj;
+             p.total_sold_qty *= vol_adj;
+             p.total_outstanding_buy_qty *= vol_adj;
+             p.total_outstanding_sell_qty *= vol_adj;
            })
       .def_readonly("qty", &Position::qty)
       .def_readonly("cx_qty", &Position::cx_qty)
@@ -575,7 +613,9 @@ BOOST_PYTHON_MODULE(opentrade) {
               +[](const std::string &name) {
                 auto acc = AccountManager::Instance().GetSubAccount(name);
 #ifdef BACKTEST
-                if (!acc) acc = Backtest::Instance().CreateSubAccount(name);
+                if (!acc)
+                  acc = Backtest::Instance().CreateSubAccount(
+                      name.empty() ? "test" : name);
 #endif
                 return acc;
               },
@@ -632,7 +672,8 @@ BOOST_PYTHON_MODULE(opentrade) {
            })
       .def("skip", &Backtest::Skip)
       .def("set_timeout",
-           +[](Backtest &, bp::object func, double seconds) {
+           +[](Backtest &, bp::object func, bp::object seconds_obj) {
+             auto seconds = GetDouble(seconds_obj);
              if (seconds < 0) seconds = 0;
              kTimers.emplace(kTime + seconds * kMicroInSec, [func]() {
                try {
@@ -655,19 +696,7 @@ BOOST_PYTHON_MODULE(opentrade) {
            bp::make_function(+[](Backtest &, const std::string &name,
                                  bp::dict params) {
              auto user = AccountManager::Instance().GetUser(0);
-             auto params_ptr = std::make_shared<Algo::ParamMap>();
-             auto items = params.items();
-             for (auto i = 0u; i < bp::len(items); ++i) {
-               std::string key = bp::extract<std::string>(items[i][0]);
-               ParamDef::Value value;
-               if (!GetValueScalar(items[i][1], &value)) {
-                 LOG_ERROR("Invalid '"
-                           << key << "' value: "
-                           << bp::extract<const char *>(bp::str(items[i][1])));
-               } else {
-                 (*params_ptr)[key] = value;
-               }
-             }
+             auto params_ptr = ParseParams(params);
              for (auto &pair : *params_ptr) {
                if (auto pval = std::get_if<SecurityTuple>(&pair.second)) {
                  if (!pval->acc) {
@@ -683,6 +712,10 @@ BOOST_PYTHON_MODULE(opentrade) {
                LOG_ERROR("Unknown algo name: " << name);
              }
              return algo ? algo->id() : 0;
+           }))
+      .def("modify_algo",
+           bp::make_function(+[](Backtest &, Algo::IdType id, bp::dict params) {
+             AlgoManager::Instance().Modify(id, ParseParams(params));
            }));
 #endif
 }
@@ -727,21 +760,14 @@ void PrintPyError(const char *from, bool fatal) {
   }
   PyErr_Restore(ptype, pvalue, ptraceback);
   PyErr_Clear();
+#ifdef BACKTEST
+  fatal = true;
+#endif
   if (fatal) {
     LOG2_FATAL(from << "\n" << result);
   } else {
     LOG2_ERROR(from << "\n" << result);
   }
-}
-
-static inline double GetDouble(const bp::object &obj) {
-  auto ptr = obj.ptr();
-  if (PyFloat_Check(ptr)) return PyFloat_AsDouble(ptr);
-  if (PyLong_Check(ptr)) return PyLong_AsLong(ptr);
-#if PY_MAJOR_VERSION < 3
-  if (PyInt_Check(ptr)) return PyInt_AsLong(ptr);
-#endif
-  return 0;
 }
 
 bp::object GetCallable(const bp::object &m, const char *name) {

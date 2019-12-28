@@ -24,32 +24,12 @@ std::string TWAP::OnStart(const ParamMap& params) noexcept {
   auto seconds = GetParam(params, "ValidSeconds", 0);
   if (seconds < 60) return "Too short ValidSeconds, must be >= 60";
   begin_time_ = GetTime();
-  price_ = GetParam(params, "Price", 0.);
-  if (price_ > 0) price_ = RoundPrice(price_);
-
   end_time_ = begin_time_ + seconds;
-  min_size_ = GetParam(params, "MinSize", 0);
+  auto err = Modify(params);
+  if (!err.empty()) return err;
   if (min_size_ <= 0 && sec->lot_size <= 0) {
     return "MinSize required for security without lot size";
   }
-  if (min_size_ > 0 && sec->lot_size > 0) {
-    min_size_ = std::round(min_size_ / sec->lot_size) * sec->lot_size;
-  }
-  max_floor_ = GetParam(params, "MaxFloor", 0);
-  if (min_size_ > 0 && max_floor_ < min_size_) max_floor_ = 0;
-  max_pov_ = GetParam(params, "MaxPov", 0.0);
-  if (max_pov_ > 1) max_pov_ = 1;
-  auto agg = GetParam(params, "Aggression", kEmptyStr);
-  if (agg == "Low")
-    agg_ = kAggLow;
-  else if (agg == "Medium")
-    agg_ = kAggMedium;
-  else if (agg == "High")
-    agg_ = kAggHigh;
-  else if (agg == "Highest")
-    agg_ = kAggHighest;
-  else
-    return "Invalid aggression, must be in (Low, Medium, High, Highest)";
   if (GetParam(params, "InternalCross", kEmptyStr) == "Yes") {
     Cross(st_.qty, price_, st_.side, st_.acc, inst_);
   }
@@ -58,8 +38,44 @@ std::string TWAP::OnStart(const ParamMap& params) noexcept {
   return {};
 }
 
+std::string TWAP::Modify(const ParamMap& params) {
+  bool has_value;
+  price_ = GetParam(params, "Price", price_, &has_value);
+  if (has_value) {
+    if (price_ > 0) price_ = RoundPrice(price_);
+  }
+  min_size_ = GetParam(params, "MinSize", min_size_, &has_value);
+  if (has_value) {
+    if (min_size_ > 0 && st_.sec->lot_size > 0)
+      min_size_ = std::round(min_size_ / st_.sec->lot_size) * st_.sec->lot_size;
+  }
+  max_floor_ = GetParam(params, "MaxFloor", max_floor_, &has_value);
+  if (has_value) {
+    if (min_size_ > 0 && max_floor_ < min_size_) max_floor_ = 0;
+  }
+  max_pov_ = GetParam(params, "MaxPov", max_pov_);
+  if (max_pov_ > 1) max_pov_ = 1;
+  auto agg = GetParam(params, "Aggression", kEmptyStr, &has_value);
+  if (has_value) {
+    if (agg == "Low")
+      agg_ = kAggLow;
+    else if (agg == "Medium")
+      agg_ = kAggMedium;
+    else if (agg == "High")
+      agg_ = kAggHigh;
+    else if (agg == "Highest")
+      agg_ = kAggHighest;
+    else
+      return "Invalid aggression, must be in (Low, Medium, High, Highest)";
+  }
+  return {};
+}
+
 void TWAP::OnModify(const ParamMap& params) noexcept {
-  LOG_DEBUG('[' << name() << ' ' << id() << "] do nothing to OnModify");
+  auto err = Modify(params);
+  if (!err.empty()) {
+    LOG_ERROR('[' << name() << ' ' << id() << "] " << err);
+  }
 }
 
 void TWAP::OnStop() noexcept {
@@ -101,8 +117,8 @@ const ParamDefs& TWAP::GetParamDefs() noexcept {
 }
 
 double TWAP::GetLeaves() noexcept {
-  auto ratio = std::min(1., (GetTime() - begin_time_ + 1) /
-                                (0.8 * (end_time_ - begin_time_) + 1));
+  auto ratio = std::min(
+      1., (GetTime() - begin_time_ + 1) / (1. * (end_time_ - begin_time_) + 1));
   auto expect = st_.qty * ratio;
   return expect - inst_->total_exposure();
 }
